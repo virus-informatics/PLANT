@@ -17,7 +17,7 @@ def set_encoders(ohe_virus, ohe_ref, ohe_vp, ohe_rp):
     OHE_virus, OHE_ref, OHE_vp, OHE_rp = ohe_virus, ohe_ref, ohe_vp, ohe_rp
 
 
-class PatchedsemanticESM(PreTrainedModel):
+class semanticESM(PreTrainedModel):
     config_class = EsmConfig
 
     def __init__(
