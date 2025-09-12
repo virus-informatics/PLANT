@@ -8,7 +8,7 @@ class TextDataset(Dataset):
     def __init__(
         self,
         encodes_virus,
-        encodes_reference=None,  # 参照配列がない場合も考慮
+        encodes_reference=None,
         labels=None,
         censors=None,
         virus=None,
@@ -16,83 +16,67 @@ class TextDataset(Dataset):
         dates=None,
         virus_passage=None,
         reference_passage=None,
-        #genetic_dist=None,
         weight=None,
     ):
         self.input_ids_virus = encodes_virus["input_ids"]
         self.attention_mask_virus = encodes_virus["attention_mask"]
+        n = len(self.input_ids_virus)
 
-        # 参照配列がある場合のみ格納
+        self.has_reference = encodes_reference is not None
+        if self.has_reference:
+            self.input_ids_reference = encodes_reference["input_ids"]
+            self.attention_mask_reference = encodes_reference["attention_mask"]
+            assert len(self.input_ids_reference) == n, \
+                f"len(input_ids_reference)={len(self.input_ids_reference)} != len(input_ids_virus)={n}"
+            assert len(self.attention_mask_reference) == n, \
+                f"len(attention_mask_reference)={len(self.attention_mask_reference)} != len(attention_mask_virus)={n}"
+        else:
+            self.input_ids_reference = None
+            self.attention_mask_reference = None
 
-        # labels が None の場合（semantic loss のみ計算する場合）を考慮
-        self.input_ids_reference = encodes_reference["input_ids"] if labels is not None else [None] * len(self.input_ids_virus)
-        self.attention_mask_reference = encodes_reference["attention_mask"] if labels is not None else [None] * len(self.input_ids_virus)
+        def fill(x, default):
+            return x if x is not None else [default] * n
 
-        self.labels = labels if labels is not None else [None] * len(self.input_ids_virus)
-        self.censors = censors if censors is not None else [None] * len(self.input_ids_virus)
-        self.virus = virus if virus is not None else [None] * len(self.input_ids_virus)
-        self.reference = reference if reference is not None else [None] * len(self.input_ids_virus)
-        self.dates = dates if dates is not None else [None] * len(self.input_ids_virus)
-        self.virus_passage = virus_passage if virus_passage is not None else [None] * len(self.input_ids_virus)
-        self.reference_passage = reference_passage if reference_passage is not None else [None] * len(self.input_ids_virus)
-        #self.genetic_dist = genetic_dist if genetic_dist is not None else [None] * len(self.input_ids_virus)
-        self.weight = weight if weight is not None else [None] * len(self.input_ids_virus)
+        self.labels            = fill(labels,            None)
+        self.censors           = fill(censors,           None)
+        self.virus             = fill(virus,             None)
+        self.reference         = fill(reference,         None)
+        self.dates             = fill(dates,             None)
+        self.virus_passage     = fill(virus_passage,     None)
+        self.reference_passage = fill(reference_passage, None)
+        self.weight            = fill(weight,            1.0)
 
     def __getitem__(self, idx):
         item = {
             "input_ids_virus": self.input_ids_virus[idx],
             "attention_mask_virus": self.attention_mask_virus[idx],
+            "labels":  torch.tensor(self.labels[idx]  if self.labels[idx]  is not None else -10.0, dtype=torch.float),
+            "censors": torch.tensor(self.censors[idx] if self.censors[idx] is not None else 0.0,  dtype=torch.float),
+            "virus":   torch.tensor(self.virus[idx]   if self.virus[idx]   is not None else 0,    dtype=torch.long),
+            "reference": torch.tensor(self.reference[idx] if self.reference[idx] is not None else 0, dtype=torch.long),
+            "dates":  torch.tensor(self.dates[idx]    if self.dates[idx]    is not None else 0,    dtype=torch.long),
+            "virus_passage": torch.tensor(self.virus_passage[idx] if self.virus_passage[idx] is not None else 0, dtype=torch.long),
+            "reference_passage": torch.tensor(self.reference_passage[idx] if self.reference_passage[idx] is not None else 0, dtype=torch.long),
+            "weight": torch.tensor(self.weight[idx]  if self.weight[idx]  is not None else 1.0,  dtype=torch.float),
         }
 
-        # `None` の場合は適切なデフォルト値を設定
-        item["input_ids_reference"] = self.input_ids_reference[idx] if self.input_ids_reference[idx] is not None else torch.zeros_like(self.input_ids_virus[idx])
-        item["attention_mask_reference"] = self.attention_mask_reference[idx] if self.attention_mask_reference[idx] is not None else torch.zeros_like(self.attention_mask_virus[idx])
-
-        item["labels"] = torch.tensor(self.labels[idx] if self.labels[idx] is not None else -10.0, dtype=torch.float)
-        item["censors"] = torch.tensor(self.censors[idx] if self.censors[idx] is not None else 0.0, dtype=torch.float)
-        item["virus"] = torch.tensor(self.virus[idx] if self.virus[idx] is not None else 0, dtype=torch.long)
-        item["reference"] = torch.tensor(self.reference[idx] if self.reference[idx] is not None else 0, dtype=torch.long)
-        item["dates"] = torch.tensor(self.dates[idx] if self.dates[idx] is not None else 0, dtype=torch.long)
-        item["virus_passage"] = torch.tensor(self.virus_passage[idx] if self.virus_passage[idx] is not None else 0, dtype=torch.long)
-        item["reference_passage"] = torch.tensor(self.reference_passage[idx] if self.reference_passage[idx] is not None else 0, dtype=torch.long)
-        item["weight"] = torch.tensor(self.weight[idx] if self.weight[idx] is not None else 1.0, dtype=torch.float)
-
+        if self.has_reference:
+            item["input_ids_reference"] = self.input_ids_reference[idx]
+            item["attention_mask_reference"] = self.attention_mask_reference[idx]
         return item
 
     def __len__(self):
         return len(self.input_ids_virus)
 
-
     def get_unique_combinations_indices(self):
-        """
-        ユニークな組み合わせのインデックスを取得。
-        - labels がある場合: (`virus`, `reference`, `virus_passage`, `reference_passage`) に基づく
-        - labels がない場合: (`virus`) のみでグループ化
-        """
-        unique_combinations = {}
-
+        unique = {}
         for idx in range(len(self.input_ids_virus)):
-            if self.labels[idx] is not None:
-                # labels がある場合は (virus, reference, virus_passage, reference_passage) でグループ化
+            if self.has_reference:
                 key = (self.virus[idx], self.reference[idx], self.virus_passage[idx], self.reference_passage[idx])
             else:
-                # labels がない場合は virus のみでグループ化
-                key = (self.input_ids_virus[idx],)
-
-            if key not in unique_combinations:
-                unique_combinations[key] = []
-            unique_combinations[key].append(idx)
-
-        return unique_combinations
-
-
-
-
-
-
-
-
-
+                key = (self.virus[idx],)
+            unique.setdefault(key, []).append(idx)
+        return unique
 
 
 def tokenize_sequences(seq, tokenizer: PreTrainedTokenizerBase, MAX_LENGTH: int):
