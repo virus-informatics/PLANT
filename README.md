@@ -7,6 +7,7 @@ Seasonal influenza viruses evade host immunity through rapid antigenic evolution
 ## Trained model
 The PLANT model, trained on data up to the 2024 Southern Hemisphere season (full model), is available on the Hugging Face repository:  
 **TheSatoLab-UTokyo/PLANT**
+Altough the original model used in the preprint, please use the model in **variants/PLANT_fixed**.
 
 ## Google Colab notebook
 A Colab notebook for embedding your sequences of interest onto the antigenic map constructed by the full model is available at the following link:  
@@ -15,7 +16,8 @@ A Colab notebook for embedding your sequences of interest onto the antigenic map
 ## Contents
 - **training/**: Scripts used for PLANT training  
 - **papers_results/**: Results shown in the PLANT paper  
-- **src/plant/**: Simple module for PLANT inference  
+- **src/plant/**: Simple module for PLANT inference
+- **src/plant/model.py**: Model class
 - **examples/**: Example data used in the Colab notebook  
 - **Acknowledgement_table/**: GISAID acknowledgement table  
 - [Comprehensive antigenic map](https://thesatolab.github.io/PLANT/comprehensive_antigenic_maps/PLANT_all_HA.html)
