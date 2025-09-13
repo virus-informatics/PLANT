@@ -5,8 +5,8 @@ Protein Language Model for Antigenic cartography
 Seasonal influenza viruses evade host immunity through rapid antigenic evolution. Antigenicity is assessed by serological assays and typically visualized as antigenic maps, which represent antigenic differences among virus strains. However, conventional maps cannot directly infer the antigenicity of unexamined strains from their genotypes. Here, we present PLANT, a protein language model that projects influenza A/H3N2 viruses onto an antigenic map using HA protein sequences.
 
 ## Trained model
-The PLANT model, trained on data up to the 2024 Southern Hemisphere season (full model), is available on the Hugging Face repository:  
-[TheSatoLab-UTokyo/PLANT](https://huggingface.co/TheSatoLab-UTokyo/PLANT)
+The PLANT model, trained on data up to the 2024 Southern Hemisphere season (full model), is available on the Hugging Face repository: [TheSatoLab-UTokyo/PLANT](https://huggingface.co/TheSatoLab-UTokyo/PLANT)
+
 Altough the original model used in the preprint, please use the model in **variants/PLANT_fixed**.
 
 
