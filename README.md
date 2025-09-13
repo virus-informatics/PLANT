@@ -7,7 +7,7 @@ Seasonal influenza viruses evade host immunity through rapid antigenic evolution
 ## Trained model
 The PLANT model, trained on data up to the 2024 Southern Hemisphere season (full model), is available on the Hugging Face repository: [TheSatoLab-UTokyo/PLANT](https://huggingface.co/TheSatoLab-UTokyo/PLANT)
 
-Altough the original model used in the preprint, please use the model in **variants/PLANT_fixed**.
+Altough the original model used in the preprint, please use the fixed model with improved performance in **variants/PLANT_fixed**.
 
 
 ## Google Colab notebook
