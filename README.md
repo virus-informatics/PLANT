@@ -9,6 +9,8 @@ The PLANT model, trained on data up to the 2024 Southern Hemisphere season (full
 
 Altough the original model used in the preprint, please use the fixed model with improved performance in **variants/PLANT_fixed**.
 
+## Core component of PLANT
+Please refer to **src/plant/model.py** if you are interested in the implementation of PLANT and its pLM-DMS.
 
 ## Google Colab notebook
 A Colab notebook for embedding your sequences of interest onto the antigenic map constructed by the full model is available at the following link:  
