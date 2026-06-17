@@ -42,6 +42,7 @@ from plant import (  # noqa: E402
     BalancedCombinationTrainer,
     TextDataset,
     build_plant_optimizer,
+    compute_embedding_distances,
     embed_sequences,
     estimate_embed_scale_factor,
     semanticESM,
@@ -79,35 +80,43 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gisaid-csv",
         default=None,
-        help="Optional CSV whose seq column will be embedded after training.",
+        help=(
+            "CSV whose seq column will be embedded after training. "
+            "Default: data/PLANT_epiflu_human_241212.csv, matching the original trainer."
+        ),
+    )
+    parser.add_argument(
+        "--skip-gisaid",
+        action="store_true",
+        help="Skip embedding the default/all-sequence GISAID CSV after training.",
     )
     parser.add_argument("--checkpoint", default=None, help="Checkpoint to resume from.")
     parser.add_argument("--model", default="facebook/esm2_t33_650M_UR50D")
     parser.add_argument("--max-length", default=329, type=int)
-    parser.add_argument("--batch-size", default=16, type=int)
-    parser.add_argument("--eval-batch-size", default=32, type=int)
-    parser.add_argument("--embedding-batch-size", default=128, type=int)
-    parser.add_argument("--num-steps", default=20000, type=int)
-    parser.add_argument("--random-seed", default=42, type=int)
-    parser.add_argument("--learning-rate", default=1e-4, type=float)
-    parser.add_argument("--weight-decay", default=0.01, type=float)
-    parser.add_argument("--reg-weight-decay", default=0.01, type=float)
-    parser.add_argument("--max-saves", default=1, type=int)
-    parser.add_argument("--save-steps", default=1000, type=int)
-    parser.add_argument("--eval-steps", default=1000, type=int)
-    parser.add_argument("--warmup-ratio", default=0.1, type=float)
-    parser.add_argument("--num-samples-per-combination", default=1, type=int)
-    parser.add_argument("--CSE-w", default=0.0, type=float)
-    parser.add_argument("--CSE-w-virus-only", default=0.0, type=float)
-    parser.add_argument("--semantic-w", default=0.2, type=float)
-    parser.add_argument("--semantic-w-virus-only", default=0.2, type=float)
-    parser.add_argument("--cart-w", default=0.05, type=float)
-    parser.add_argument("--dropout-regressor", default=0.05, type=float)
-    parser.add_argument("--reg-intermediate-dim", default=256, type=int)
-    parser.add_argument("--CSE-alpha", default=0.0, type=float)
-    parser.add_argument("--intermediate-dim-encoder", default=64, type=int)
-    parser.add_argument("--dropout-encoder", default=0.1, type=float)
-    parser.add_argument("--lg-w", default=0.01, type=float)
+    parser.add_argument("--batch-size", "--batch_size", dest="batch_size", default=16, type=int)
+    parser.add_argument("--eval-batch-size", "--eval_batch_size", dest="eval_batch_size", default=32, type=int)
+    parser.add_argument("--embedding-batch-size", "--embedding_batch_size", dest="embedding_batch_size", default=128, type=int)
+    parser.add_argument("--num-steps", "--num_steps", dest="num_steps", default=20000, type=int)
+    parser.add_argument("--random-seed", "--random_seed", dest="random_seed", default=42, type=int)
+    parser.add_argument("--learning-rate", "--learning_rate", dest="learning_rate", default=1e-4, type=float)
+    parser.add_argument("--weight-decay", "--weight_decay", dest="weight_decay", default=0.01, type=float)
+    parser.add_argument("--reg-weight-decay", "--reg_weight_decay", dest="reg_weight_decay", default=0.01, type=float)
+    parser.add_argument("--max-saves", "--max_saves", dest="max_saves", default=1, type=int)
+    parser.add_argument("--save-steps", "--save_steps", dest="save_steps", default=1000, type=int)
+    parser.add_argument("--eval-steps", "--eval_steps", dest="eval_steps", default=1000, type=int)
+    parser.add_argument("--warmup-ratio", "--warmup_ratio", dest="warmup_ratio", default=0.1, type=float)
+    parser.add_argument("--num-samples-per-combination", "--num_samples_per_combination", dest="num_samples_per_combination", default=1, type=int)
+    parser.add_argument("--CSE-w", "--CSE_w", dest="CSE_w", default=0.0, type=float)
+    parser.add_argument("--CSE-w-virus-only", "--CSE_w_virus_only", dest="CSE_w_virus_only", default=0.0, type=float)
+    parser.add_argument("--semantic-w", "--semantic_w", dest="semantic_w", default=0.2, type=float)
+    parser.add_argument("--semantic-w-virus-only", "--semantic_w_virus_only", dest="semantic_w_virus_only", default=0.2, type=float)
+    parser.add_argument("--cart-w", "--cart_w", dest="cart_w", default=0.05, type=float)
+    parser.add_argument("--dropout-regressor", "--dropout_regressor", dest="dropout_regressor", default=0.05, type=float)
+    parser.add_argument("--reg-intermediate-dim", "--reg_intermediate_dim", dest="reg_intermediate_dim", default=256, type=int)
+    parser.add_argument("--CSE-alpha", "--CSE_alpha", dest="CSE_alpha", default=0.0, type=float)
+    parser.add_argument("--intermediate-dim-encoder", "--intermediate_dim_encoder", dest="intermediate_dim_encoder", default=64, type=int)
+    parser.add_argument("--dropout-encoder", "--dropout_encoder", dest="dropout_encoder", default=0.1, type=float)
+    parser.add_argument("--lg-w", "--lg_w", dest="lg_w", default=0.01, type=float)
     parser.add_argument("--no-fp16", action="store_true")
     return parser.parse_args()
 
@@ -403,26 +412,41 @@ def main() -> None:
     print("Fitting one-hot encoders...")
     ohe_virus = make_one_hot_encoder(selected_df_train["virus_category"])
     ohe_ref = make_one_hot_encoder(selected_df_train["reference_category"])
+    ohe_date = make_one_hot_encoder(selected_df_train["date_category"])
     ohe_vp = make_one_hot_encoder(selected_df_train["virus_passage_category"])
     ohe_rp = make_one_hot_encoder(selected_df_train["reference_passage_category"])
     set_encoders(ohe_virus, ohe_ref, ohe_vp, ohe_rp)
 
     joblib.dump(ohe_virus, outputs_path / "virus_encoder.joblib")
     joblib.dump(ohe_ref, outputs_path / "ref_encoder.joblib")
+    joblib.dump(ohe_date, outputs_path / "date_encoder.joblib")
     joblib.dump(ohe_vp, outputs_path / "vp_encoder.joblib")
     joblib.dump(ohe_rp, outputs_path / "rp_encoder.joblib")
 
     effects_len = len(ohe_ref.categories_[0]) + len(ohe_vp.categories_[0]) + len(ohe_rp.categories_[0])
     virus_effects_len = len(ohe_virus.categories_[0])
 
-    print("Estimating ESM embedding scale factor...")
-    embed_scale_factor = estimate_embed_scale_factor(
+    print("Computing frozen ESM embedding distances...")
+    embed_dist_train = compute_embedding_distances(
         dataset_train,
         esm_model_name=args.model,
         batch_size=args.embedding_batch_size,
         use_fp16=not args.no_fp16,
     )
+    selected_df_train = selected_df_train.copy()
+    selected_df_train["embed_dist"] = embed_dist_train
+    embed_scale_factor = float(np.quantile(embed_dist_train, 0.99))
     print(f"embed_scale_factor: {embed_scale_factor:.6g}")
+
+    # The original trainer also records embed_dist for the held-out test table.
+    embed_dist_test = compute_embedding_distances(
+        dataset_test,
+        esm_model_name=args.model,
+        batch_size=args.embedding_batch_size,
+        use_fp16=not args.no_fp16,
+    )
+    selected_df_test = selected_df_test.copy()
+    selected_df_test["embed_dist"] = embed_dist_test
 
     print("Building PLANT model...")
     esm_config = EsmConfig.from_pretrained(args.model, use_safetensors=True)
@@ -523,9 +547,10 @@ def main() -> None:
     )
     print(f"Pearson correlation: {corr:.4f} (p-value: {p_value:.4g})")
 
-    if args.gisaid_csv:
-        print("Embedding additional GISAID/all-sequence CSV...")
-        gisaid_df = pd.read_csv(args.gisaid_csv)
+    gisaid_csv = Path(args.gisaid_csv) if args.gisaid_csv else storage_path / "data" / "PLANT_epiflu_human_241212.csv"
+    if not args.skip_gisaid and gisaid_csv.exists():
+        print("Embedding GISAID/all-sequence CSV...")
+        gisaid_df = pd.read_csv(gisaid_csv)
         if "seq" not in gisaid_df.columns:
             raise ValueError("--gisaid-csv must contain a 'seq' column.")
         gisaid_df = gisaid_df[
@@ -545,7 +570,7 @@ def main() -> None:
         gisaid_df["z1"] = coords[:, 0]
         gisaid_df["z2"] = coords[:, 1]
         gisaid_df["z3"] = coords[:, 2]
-        gisaid_out = outputs_path / f"{Path(args.gisaid_csv).stem}_with_coords.csv"
+        gisaid_out = outputs_path / f"{gisaid_csv.stem}_with_coords.csv"
         gisaid_df.to_csv(gisaid_out, index=False)
         print(f"Saved: {gisaid_out}")
 
