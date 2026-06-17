@@ -31,4 +31,4 @@ Jumpei Ito, Shusuke Kawakubo, Hiroaki Unno, Adam Strange, Spyros Lytras, Kaho Ok
 bioRxiv 2025.08.04.668423; doi: https://doi.org/10.1101/2025.08.04.668423
 
 ## Contact
-jampei@g.ecc.u-tokyo.ac.jp (Jumpei Ito)
+jumpeiito@biken.osaka-u.ac.jp (Jumpei Ito)
