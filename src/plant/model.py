@@ -7,14 +7,21 @@ semantic regularization data.
 
 from __future__ import annotations
 
+import contextlib
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 import torch.nn as nn
 from safetensors.torch import load_file as safe_load
 from transformers import AutoModel, EsmConfig, PreTrainedModel
 from transformers.utils import ModelOutput
+
+try:
+    from peft import LoraConfig, get_peft_model
+except ImportError:  # pragma: no cover - PEFT is optional unless use_lora=True.
+    LoraConfig = None
+    get_peft_model = None
 
 
 OHE_virus = None
@@ -72,6 +79,12 @@ class semanticESM(PreTrainedModel):
         CART_W: float = 0.05,
         LG_W: float = 0.01,
         missing_label_value: float = MISSING_LABEL_VALUE,
+        use_lora: bool = True, #False,
+        lora_r: int = 16,
+        lora_alpha: int = 32,
+        lora_dropout: float = 0.05,
+        lora_target_modules: Optional[Sequence[str]] = None,
+        lora_bias: str = "none",
     ) -> None:
         super().__init__(config)
 
@@ -84,11 +97,35 @@ class semanticESM(PreTrainedModel):
                 + _safe_category_count(OHE_rp)
             )
 
-        self.esm_model = AutoModel.from_pretrained(
+        self.use_lora = bool(use_lora)
+        self.lora_target_modules = list(lora_target_modules or ["query", "value"])
+
+        base_esm_model = AutoModel.from_pretrained(
             esm_model_name, add_pooling_layer=False
         )
-        self.esm_model_original = self._initialize_frozen_esm_model(esm_model_name)
-        self.embedding_dim = self.esm_model.config.hidden_size
+        self.embedding_dim = base_esm_model.config.hidden_size
+
+        if self.use_lora:
+            if LoraConfig is None or get_peft_model is None:
+                raise ImportError(
+                    "use_lora=True requires the `peft` package. Install it with `pip install peft`."
+                )
+            for param in base_esm_model.parameters():
+                param.requires_grad = False
+            lora_config = LoraConfig(
+                r=lora_r,
+                lora_alpha=lora_alpha,
+                target_modules=self.lora_target_modules,
+                lora_dropout=lora_dropout,
+                bias=lora_bias,
+            )
+            self.esm_model = get_peft_model(base_esm_model, lora_config)
+            # In LoRA mode, the original frozen ESM is obtained by temporarily
+            # disabling adapters on this single shared backbone.
+            self.esm_model_original = None
+        else:
+            self.esm_model = base_esm_model
+            self.esm_model_original = self._initialize_frozen_esm_model(esm_model_name)
 
         self.regressor = nn.Sequential(
             nn.Linear(self.embedding_dim, intermediate_dim),
@@ -140,9 +177,10 @@ class semanticESM(PreTrainedModel):
         return esm_model
 
     def train(self, mode: bool = True):  # noqa: D401
-        """Set training mode while keeping ``esm_model_original`` in eval mode."""
+        """Set training mode while keeping the original frozen ESM path in eval mode."""
         super().train(mode)
-        self.esm_model_original.eval()
+        if self.esm_model_original is not None:
+            self.esm_model_original.eval()
         return self
 
     def encode_sequence(
@@ -165,6 +203,12 @@ class semanticESM(PreTrainedModel):
         ).toarray()
         return torch.tensor(encoded, dtype=model_dtype, device=self.device)
 
+    def _adapter_disabled_context(self):
+        """Return a context in which PEFT adapters are disabled, if available."""
+        if self.use_lora and hasattr(self.esm_model, "disable_adapter"):
+            return self.esm_model.disable_adapter()
+        return contextlib.nullcontext()
+
     def extract_pooled_embeddings(
         self,
         model: nn.Module,
@@ -172,20 +216,49 @@ class semanticESM(PreTrainedModel):
         attention_mask: torch.Tensor,
     ) -> torch.Tensor:
         """Extract frozen ESM mean+max pooled embeddings for semantic loss."""
+        was_training = model.training
         model.eval()
-        with torch.no_grad():
-            input_ids = input_ids.to(self.device)
-            attention_mask = attention_mask.to(self.device)
-            encoder_out = model(input_ids, attention_mask=attention_mask).last_hidden_state
-            masked_sum = (encoder_out * attention_mask.unsqueeze(-1)).sum(dim=1)
-            mask_count = attention_mask.sum(dim=1, keepdim=True).clamp(min=1)
-            mean_pooled = masked_sum / mask_count
+        try:
+            with torch.no_grad():
+                input_ids = input_ids.to(self.device)
+                attention_mask = attention_mask.to(self.device)
+                encoder_out = model(input_ids, attention_mask=attention_mask).last_hidden_state
+                masked_sum = (encoder_out * attention_mask.unsqueeze(-1)).sum(dim=1)
+                mask_count = attention_mask.sum(dim=1, keepdim=True).clamp(min=1)
+                mean_pooled = masked_sum / mask_count
 
-            # Avoid padded tokens dominating max pooling.
-            mask = attention_mask.unsqueeze(-1).bool()
-            masked_encoder_out = encoder_out.masked_fill(~mask, torch.finfo(encoder_out.dtype).min)
-            max_pooled = torch.max(masked_encoder_out, dim=1)[0]
-            return torch.cat([mean_pooled, max_pooled], dim=-1)
+                # Avoid padded tokens dominating max pooling.
+                mask = attention_mask.unsqueeze(-1).bool()
+                masked_encoder_out = encoder_out.masked_fill(
+                    ~mask, torch.finfo(encoder_out.dtype).min
+                )
+                max_pooled = torch.max(masked_encoder_out, dim=1)[0]
+                return torch.cat([mean_pooled, max_pooled], dim=-1)
+        finally:
+            if was_training:
+                model.train()
+
+    def extract_original_pooled_embeddings(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Extract original frozen ESM embeddings.
+
+        In full-finetuning mode this uses the separate frozen ESM copy.  In LoRA
+        mode this reuses the single ESM backbone with adapters temporarily
+        disabled, avoiding a second copy of ESM-2 in memory.
+        """
+        if self.use_lora:
+            with self._adapter_disabled_context():
+                return self.extract_pooled_embeddings(
+                    self.esm_model, input_ids, attention_mask
+                )
+        if self.esm_model_original is None:
+            raise RuntimeError("esm_model_original is not initialized.")
+        return self.extract_pooled_embeddings(
+            self.esm_model_original, input_ids, attention_mask
+        )
 
     def compute_semantic_loss(
         self,
@@ -450,8 +523,8 @@ class semanticESM(PreTrainedModel):
         input_ids_reference = input_ids_reference.to(device)
         attention_mask_reference = attention_mask_reference.to(device)
 
-        virus_embedding_original = self.extract_pooled_embeddings(
-            self.esm_model_original, input_ids_virus, attention_mask_virus
+        virus_embedding_original = self.extract_original_pooled_embeddings(
+            input_ids_virus, attention_mask_virus
         )
 
         # Semantic-only loss for virus-only examples.
@@ -531,8 +604,7 @@ class semanticESM(PreTrainedModel):
             observed_distance = distance + systematic_error
             logits_labeled = torch.cat((observed_distance, distance), dim=1)
 
-            reference_embedding_original = self.extract_pooled_embeddings(
-                self.esm_model_original,
+            reference_embedding_original = self.extract_original_pooled_embeddings(
                 input_ids_reference_labeled,
                 attention_mask_reference_labeled,
             )
