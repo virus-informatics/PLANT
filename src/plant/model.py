@@ -268,13 +268,13 @@ class semanticESM(PreTrainedModel):
     ) -> torch.Tensor:
         uncensored_loss = self.mse_loss_wo_mean(predictions, targets) * (1 - censors)
         censored_loss = self.mse_loss_wo_mean(
-            predictions, torch.minimum(predictions, targets)
+            predictions, torch.maximum(predictions, targets)
         ) * censors
         uncensored_loss_cart = self.mse_loss_wo_mean(predictions_cart, targets) * (
             1 - censors
         )
         censored_loss_cart = self.mse_loss_wo_mean(
-            predictions_cart, torch.minimum(predictions_cart, targets)
+            predictions_cart, torch.maximum(predictions_cart, targets)
         ) * censors
 
         uncensored_loss = uncensored_loss * weight
