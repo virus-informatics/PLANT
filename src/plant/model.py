@@ -222,9 +222,26 @@ class semanticESM(PreTrainedModel):
             return torch.tensor(0.0, device=embeddings1.device)
         distance_matrix = torch.cdist(embeddings1, embeddings2, p=2)
         positive_loss = torch.mean(torch.diag(distance_matrix))
-        margin_loss = torch.clamp(margin - distance_matrix, min=0)
-        weight = torch.exp(-alpha * distance_matrix)
-        negative_loss = torch.mean(weight * margin_loss)
+
+        # Negative pairs should exclude the diagonal positive pairs.  Otherwise,
+        # the same sequence pairs are simultaneously pulled together by the
+        # positive term and pushed apart by the margin term.
+        if distance_matrix.size(0) == distance_matrix.size(1):
+            off_diag_mask = ~torch.eye(
+                distance_matrix.size(0),
+                device=distance_matrix.device,
+                dtype=torch.bool,
+            )
+            negative_distances = distance_matrix[off_diag_mask]
+        else:
+            negative_distances = distance_matrix.reshape(-1)
+
+        if negative_distances.numel() == 0:
+            negative_loss = torch.tensor(0.0, device=embeddings1.device)
+        else:
+            margin_loss = torch.clamp(margin - negative_distances, min=0)
+            weight = torch.exp(-alpha * negative_distances)
+            negative_loss = torch.mean(weight * margin_loss)
         return positive_loss + negative_loss
 
     def local_global_loss(
@@ -400,17 +417,24 @@ class semanticESM(PreTrainedModel):
         virus_regressor_out = self.regressor(
             self.encode_sequence(self.esm_model, input_ids_virus, attention_mask_virus)
         )
-        virus_regressor_out2 = self.regressor(
-            self.encode_sequence(self.esm_model, input_ids_virus, attention_mask_virus)
-        )
 
         # Fast path for pure inference: sequence -> PLANT coordinates.
+        # Keep this before the optional second stochastic forward pass so
+        # inference and all-sequence embedding do not run ESM twice.
         if labels is None and input_ids_reference is None:
             return ModelOutput(
                 loss=torch.tensor(0.0, device=device),
                 logits=None,
                 hidden_state_virus=virus_regressor_out,
             )
+
+        needs_virus_cse = (self.CSE_W != 0.0) or (self.CSE_W_VIRUS_ONLY != 0.0)
+        if needs_virus_cse:
+            virus_regressor_out2 = self.regressor(
+                self.encode_sequence(self.esm_model, input_ids_virus, attention_mask_virus)
+            )
+        else:
+            virus_regressor_out2 = virus_regressor_out
 
         batch_size = input_ids_virus.size(0)
         if labels is None:
@@ -453,13 +477,16 @@ class semanticESM(PreTrainedModel):
                     attention_mask_reference_labeled,
                 )
             )
-            reference_regressor_out2 = self.regressor(
-                self.encode_sequence(
-                    self.esm_model,
-                    input_ids_reference_labeled,
-                    attention_mask_reference_labeled,
+            if self.CSE_W != 0.0:
+                reference_regressor_out2 = self.regressor(
+                    self.encode_sequence(
+                        self.esm_model,
+                        input_ids_reference_labeled,
+                        attention_mask_reference_labeled,
+                    )
                 )
-            )
+            else:
+                reference_regressor_out2 = reference_regressor_out
             distance = torch.norm(
                 virus_regressor_out[has_labels_mask] - reference_regressor_out,
                 p=2,
