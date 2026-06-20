@@ -15,6 +15,26 @@ from transformers import AutoModel, EsmConfig, PreTrainedModel, Trainer
 from transformers.utils import ModelOutput
 
 
+def _mixed_precision_dtype(
+    device: torch.device,
+    *,
+    use_bf16: bool = True,
+    use_fp16: bool = False,
+) -> Optional[torch.dtype]:
+    """Choose the mixed-precision dtype for CUDA helper inference.
+
+    BF16 is preferred when requested and supported.  FP16 is kept as an
+    explicit fallback for older GPUs.  CPU execution uses full precision.
+    """
+    if device.type != "cuda":
+        return None
+    if use_bf16 and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    if use_fp16:
+        return torch.float16
+    return None
+
+
 class BalancedCombinationTrainer(Trainer):
     """Trainer that samples at most N examples per experimental combination.
 
@@ -196,21 +216,28 @@ def compute_embedding_distances(
     esm_model_name: str,
     batch_size: int = 128,
     device: Optional[torch.device | str] = None,
-    use_fp16: bool = True,
+    use_bf16: bool = True,
+    use_fp16: bool = False,
 ) -> np.ndarray:
     """Compute frozen ESM embedding distances for paired examples."""
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    mixed_dtype = _mixed_precision_dtype(
+        device, use_bf16=use_bf16, use_fp16=use_fp16
+    )
+
     config = EsmConfig.from_pretrained(esm_model_name)
-    model = ESMEmbeddingDistanceModel(config, esm_model_name).to(device)
-    if use_fp16 and device.type == "cuda":
-        model = model.half()
+    model = ESMEmbeddingDistanceModel(config, esm_model_name)
+    if mixed_dtype is not None:
+        model = model.to(device=device, dtype=mixed_dtype)
+    else:
+        model = model.to(device)
     model.eval()
 
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
     distances = []
     autocast_ctx = (
-        torch.autocast(device_type="cuda", dtype=torch.float16)
-        if use_fp16 and device.type == "cuda"
+        torch.autocast(device_type="cuda", dtype=mixed_dtype)
+        if mixed_dtype is not None and device.type == "cuda"
         else nullcontext()
     )
     with autocast_ctx:
@@ -232,7 +259,8 @@ def estimate_embed_scale_factor(
     quantile: float = 0.99,
     batch_size: int = 128,
     device: Optional[torch.device | str] = None,
-    use_fp16: bool = True,
+    use_bf16: bool = True,
+    use_fp16: bool = False,
 ) -> float:
     """Estimate the semantic-loss scale factor used in PLANT training."""
     distances = compute_embedding_distances(
@@ -240,6 +268,7 @@ def estimate_embed_scale_factor(
         esm_model_name=esm_model_name,
         batch_size=batch_size,
         device=device,
+        use_bf16=use_bf16,
         use_fp16=use_fp16,
     )
     return float(np.quantile(distances, quantile))

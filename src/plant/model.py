@@ -53,7 +53,7 @@ class semanticESM(PreTrainedModel):
     During training, examples with ``labels == -10`` are treated as virus-only
     examples and contribute only to the semantic regularization loss.  Examples
     with real labels contribute to the supervised antigenic-distance loss plus
-    the semantic and local/global regularizers.
+    the semantic and optional local/global regularizers.
     """
 
     config_class = EsmConfig
@@ -77,7 +77,7 @@ class semanticESM(PreTrainedModel):
         CSE_W_VIRUS_ONLY: float = 0.0,
         SEMANTIC_W_VIRUS_ONLY: float = 0.2,
         CART_W: float = 0.05,
-        LG_W: float = 0.01,
+        LG_W: float = 0.0,
         missing_label_value: float = MISSING_LABEL_VALUE,
         use_lora: bool = True, #False,
         lora_r: int = 16,
@@ -381,9 +381,12 @@ class semanticESM(PreTrainedModel):
         contrastive_loss_value = self.contrastive_loss_semantic(
             combined_latents, combined_latents2, alpha=self.CSE_ALPHA
         )
-        local_global_loss_value = self.local_global_loss(
-            combined_latents, k_local=3, margin_global=0.125
-        )
+        if self.LG_W != 0.0:
+            local_global_loss_value = self.local_global_loss(
+                combined_latents, k_local=3, margin_global=0.125
+            )
+        else:
+            local_global_loss_value = combined_latents.new_tensor(0.0)
         semantic_loss = self.compute_semantic_loss(
             combined_latents,
             combined_latents_original,
@@ -410,9 +413,12 @@ class semanticESM(PreTrainedModel):
         contrastive_loss_value = self.contrastive_loss_semantic(
             virus_regressor_out, virus_regressor_out2, alpha=self.CSE_ALPHA
         )
-        local_global_loss_value = self.local_global_loss(
-            virus_regressor_out, k_local=3, margin_global=0.125
-        )
+        if self.LG_W != 0.0:
+            local_global_loss_value = self.local_global_loss(
+                virus_regressor_out, k_local=3, margin_global=0.125
+            )
+        else:
+            local_global_loss_value = virus_regressor_out.new_tensor(0.0)
         semantic_loss = self.compute_semantic_loss(
             virus_regressor_out,
             virus_embedding_original,

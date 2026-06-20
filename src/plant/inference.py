@@ -9,14 +9,25 @@ import torch
 
 
 @torch.no_grad()
-def embed_sequences(model, dataloader, use_fp16: bool = True) -> np.ndarray:
+def embed_sequences(
+    model,
+    dataloader,
+    use_bf16: bool = True,
+    use_fp16: bool = False,
+) -> np.ndarray:
     """Return PLANT latent coordinates for virus sequences."""
     model.eval()
     device = next(model.parameters()).device
     outs = []
+    mixed_dtype = None
+    if torch.cuda.is_available() and device.type == "cuda":
+        if use_bf16 and torch.cuda.is_bf16_supported():
+            mixed_dtype = torch.bfloat16
+        elif use_fp16:
+            mixed_dtype = torch.float16
     ctx = (
-        torch.autocast(device_type="cuda", dtype=torch.float16)
-        if use_fp16 and torch.cuda.is_available() and device.type == "cuda"
+        torch.autocast(device_type="cuda", dtype=mixed_dtype)
+        if mixed_dtype is not None
         else nullcontext()
     )
     with ctx:
