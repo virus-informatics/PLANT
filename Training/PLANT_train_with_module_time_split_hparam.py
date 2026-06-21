@@ -145,6 +145,19 @@ def parse_args() -> argparse.Namespace:
         type=float,
         help="Weight for penalizing the data-scale shift of transformed reference points.",
     )
+    parser.add_argument(
+        "--time-cutoff-date",
+        "--time_cutoff_date",
+        dest="time_cutoff_date",
+        default="2024-01-31",
+        help=(
+            "Cutoff date for past/future evaluation split based on the paired-data "
+            "'date' column. Rows with resolved dates <= cutoff are used for the "
+            "random train/validation/test split; rows after cutoff are held out "
+            "as the future dataset. Incomplete dates are resolved conservatively "
+            "to the latest possible date."
+        ),
+    )
     parser.add_argument("--no-fp16", action="store_true")
     return parser.parse_args()
 
@@ -203,6 +216,93 @@ def complete_date(date_str) -> str:
     except ValueError:
         pass
     return date_str
+
+
+
+def resolve_partial_date_for_time_split(date_value) -> pd.Timestamp:
+    """Resolve incomplete date strings to the latest plausible date.
+
+    This is used only for the past/future split.  The paired dataset can contain
+    partially specified or non-standard strings such as ``1993-aaa``.  To avoid
+    leaking ambiguous records into the past set, missing/invalid month and day
+    components are filled with the latest possible values: month=12 and
+    day=last day of month.  Examples:
+
+    - ``1993-aaa`` -> ``1993-12-31``
+    - ``2024-01-aaa`` -> ``2024-01-31``
+    - ``2024-01`` -> ``2024-01-31``
+    """
+    if pd.isna(date_value):
+        return pd.NaT
+
+    raw = str(date_value).strip()
+    if not raw:
+        return pd.NaT
+
+    parts = raw.split("-")
+    if not parts or not parts[0].isdigit():
+        return pd.NaT
+
+    try:
+        year = int(parts[0])
+    except ValueError:
+        return pd.NaT
+
+    if year < 1:
+        return pd.NaT
+
+    month = 12
+    if len(parts) >= 2 and parts[1].isdigit():
+        parsed_month = int(parts[1])
+        if 1 <= parsed_month <= 12:
+            month = parsed_month
+
+    last_day = calendar.monthrange(year, month)[1]
+    day = last_day
+    if len(parts) >= 3 and parts[2].isdigit():
+        parsed_day = int(parts[2])
+        if 1 <= parsed_day <= last_day:
+            day = parsed_day
+
+    return pd.Timestamp(year=year, month=month, day=day)
+
+
+def split_past_future_by_cutoff(
+    df: pd.DataFrame,
+    *,
+    cutoff_date: str,
+    date_col: str = "date",
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Split paired data into past and future sets using a cutoff date.
+
+    Rows with resolved dates <= cutoff are assigned to the past set.  Rows with
+    resolved dates > cutoff are assigned to the future set.
+    """
+    cutoff = pd.Timestamp(cutoff_date)
+    out = df.copy()
+    out["date_for_time_split"] = out[date_col].apply(resolve_partial_date_for_time_split)
+
+    unparseable = out["date_for_time_split"].isna()
+    if unparseable.any():
+        print(
+            "Dropping rows with unparseable date values for time split: "
+            f"{int(unparseable.sum())}"
+        )
+        out = out.loc[~unparseable].copy()
+
+    past = out.loc[out["date_for_time_split"] <= cutoff].copy()
+    future = out.loc[out["date_for_time_split"] > cutoff].copy()
+
+    if past.empty:
+        raise ValueError(
+            f"No rows were assigned to the past set using cutoff_date={cutoff_date!r}."
+        )
+    if future.empty:
+        raise ValueError(
+            f"No rows were assigned to the future set using cutoff_date={cutoff_date!r}."
+        )
+
+    return past.reset_index(drop=True), future.reset_index(drop=True)
 
 
 def load_sequence_pool(fasta_path: Path, metadata_path: Path | None) -> pd.DataFrame:
@@ -628,6 +728,52 @@ def write_prediction_metrics(df: pd.DataFrame, output_path: Path) -> None:
     output_path.write_text("\n".join(lines))
 
 
+
+def predict_and_save_split(
+    trainer: BalancedCombinationTrainer,
+    dataset: TextDataset,
+    df: pd.DataFrame,
+    outputs_path: Path,
+    *,
+    split_name: str,
+) -> tuple[pd.DataFrame, dict[str, float]]:
+    """Predict one held-out split, save predictions/metrics, and return metrics."""
+    print(f"Predicting {split_name} data...")
+    predictions = trainer.predict(dataset)
+    logits = _extract_logits(predictions.predictions)
+    out_df = add_prediction_columns_from_logits(df, logits)
+
+    if isinstance(predictions.predictions, tuple) and len(predictions.predictions) > 1:
+        latent = predictions.predictions[1]
+        out_df[["z1", "z2", "z3"]] = latent[:, :3]
+
+    csv_path = outputs_path / f"{split_name}_df_full.csv"
+    out_df.to_csv(csv_path, index=False)
+
+    metrics_file = outputs_path / f"{split_name}_prediction_metrics.txt"
+    write_prediction_metrics(out_df, metrics_file)
+
+    # Backward-compatible filename for workflows that still look for the old output.
+    legacy_corr_file = outputs_path / f"{split_name}_prediction_correlations.txt"
+    write_prediction_metrics(out_df, legacy_corr_file)
+
+    metrics = compute_prediction_metrics_from_dataframe(out_df)
+    corr = metrics["pearson_censor_cap"]
+    spearman = metrics["spearman_censor_cap"]
+    mae = metrics["mae_censor_cap"]
+    rmse = metrics["rmse_censor_cap"]
+    print(
+        f"{split_name} metrics for predicted_dist_censor_cap: "
+        f"Pearson={corr:.4f}, Spearman={spearman:.4f}, "
+        f"MAE={mae:.4f}, RMSE={rmse:.4f}"
+    )
+    print(f"Saved {split_name} predictions: {csv_path}")
+    print(f"Saved {split_name} metrics: {metrics_file}")
+    print(f"Saved {split_name} legacy metrics/correlations: {legacy_corr_file}")
+
+    return out_df, metrics
+
+
 def main() -> None:
     start = time.time()
     args = parse_args()
@@ -671,25 +817,41 @@ def main() -> None:
     )
     print("Loading paired antigenic-distance data...")
     selected_df = clean_paired_dataset(paired_csv, args.max_length, args.random_seed)
+    selected_df_past, selected_df_future = split_past_future_by_cutoff(
+        selected_df,
+        cutoff_date=args.time_cutoff_date,
+        date_col="date",
+    )
+
     selected_df_train_val, selected_df_test = split_dataframe_with_stratified_group_kfold(
-        selected_df, train_ratio=0.8, seed=args.random_seed
+        selected_df_past, train_ratio=0.8, seed=args.random_seed
     )
     selected_df_test = selected_df_test.copy()
     selected_df_test["weight"] = 1.0
+    selected_df_future = selected_df_future.copy()
+    selected_df_future["weight"] = 1.0
+
     selected_df_train_val = add_density_weights(selected_df_train_val)
     selected_df_train, selected_df_val = split_dataframe_with_stratified_group_kfold(
         selected_df_train_val, train_ratio=8 / 9, seed=args.random_seed
     )
 
-    print(
-        json.dumps(
-            {
-                "train": len(selected_df_train),
-                "validation": len(selected_df_val),
-                "test": len(selected_df_test),
-            },
-            indent=2,
-        )
+    split_summary = {
+        "time_cutoff_date": args.time_cutoff_date,
+        "all_after_cleaning": len(selected_df),
+        "past_total": len(selected_df_past),
+        "future": len(selected_df_future),
+        "train": len(selected_df_train),
+        "validation": len(selected_df_val),
+        "test": len(selected_df_test),
+        "past_min_date": str(selected_df_past["date_for_time_split"].min().date()),
+        "past_max_date": str(selected_df_past["date_for_time_split"].max().date()),
+        "future_min_date": str(selected_df_future["date_for_time_split"].min().date()),
+        "future_max_date": str(selected_df_future["date_for_time_split"].max().date()),
+    }
+    print(json.dumps(split_summary, indent=2))
+    (outputs_path / "split_summary.json").write_text(
+        json.dumps(split_summary, indent=2, sort_keys=True)
     )
 
     print("Loading virus-only sequence pool...")
@@ -702,6 +864,7 @@ def main() -> None:
     dataset_train = make_paired_dataset(selected_df_train, tokenizer, args.max_length)
     dataset_val = make_paired_dataset(selected_df_val, tokenizer, args.max_length)
     dataset_test = make_paired_dataset(selected_df_test, tokenizer, args.max_length)
+    dataset_future = make_paired_dataset(selected_df_future, tokenizer, args.max_length)
     dataset_virus_only = make_virus_only_dataset(sequence_pool_df, tokenizer, args.max_length)
     dataset_train_combined = ConcatDataset([dataset_train, dataset_virus_only])
 
@@ -745,6 +908,16 @@ def main() -> None:
     )
     selected_df_test = selected_df_test.copy()
     selected_df_test["embed_dist"] = embed_dist_test
+
+    embed_dist_future = compute_embedding_distances(
+        dataset_future,
+        esm_model_name=args.model,
+        batch_size=args.embedding_batch_size,
+        use_bf16=bf16,
+        use_fp16=fp16,
+    )
+    selected_df_future = selected_df_future.copy()
+    selected_df_future["embed_dist"] = embed_dist_future
 
     print("Building PLANT model...")
     esm_config = EsmConfig.from_pretrained(args.model, use_safetensors=True)
@@ -831,40 +1004,44 @@ def main() -> None:
             "fp16": fp16,
             "embed_scale_factor": embed_scale_factor,
             "model_dir": str(final_model_dir),
+            "split_summary": split_summary,
         }
     )
     (outputs_path / "training_config.json").write_text(
         json.dumps(run_config, indent=2, sort_keys=True)
     )
 
-    print("Predicting held-out test data...")
-    predictions = trainer.predict(dataset_test)
-    logits = _extract_logits(predictions.predictions)
-    selected_df_test = add_prediction_columns_from_logits(selected_df_test, logits)
-
-    if isinstance(predictions.predictions, tuple) and len(predictions.predictions) > 1:
-        latent = predictions.predictions[1]
-        selected_df_test[["z1", "z2", "z3"]] = latent[:, :3]
-
-    test_csv = outputs_path / "test_df_full.csv"
-    selected_df_test.to_csv(test_csv, index=False)
-    metrics_file = outputs_path / "test_prediction_metrics.txt"
-    write_prediction_metrics(selected_df_test, metrics_file)
-    # Backward-compatible filename for workflows that still look for the old output.
-    legacy_corr_file = outputs_path / "test_prediction_correlations.txt"
-    write_prediction_metrics(selected_df_test, legacy_corr_file)
-    test_metrics = compute_prediction_metrics_from_dataframe(selected_df_test)
-    corr = test_metrics["pearson_censor_cap"]
-    spearman = test_metrics["spearman_censor_cap"]
-    mae = test_metrics["mae_censor_cap"]
-    rmse = test_metrics["rmse_censor_cap"]
-    print(
-        "Test metrics for predicted_dist_censor_cap: "
-        f"Pearson={corr:.4f}, Spearman={spearman:.4f}, "
-        f"MAE={mae:.4f}, RMSE={rmse:.4f}"
+    selected_df_test, test_metrics = predict_and_save_split(
+        trainer,
+        dataset_test,
+        selected_df_test,
+        outputs_path,
+        split_name="test",
     )
-    print(f"Saved metrics: {metrics_file}")
-    print(f"Saved legacy metrics/correlations: {legacy_corr_file}")
+    selected_df_future, future_metrics = predict_and_save_split(
+        trainer,
+        dataset_future,
+        selected_df_future,
+        outputs_path,
+        split_name="future",
+    )
+    heldout_summary = {
+        "test": {
+            "pearson_censor_cap": test_metrics["pearson_censor_cap"],
+            "spearman_censor_cap": test_metrics["spearman_censor_cap"],
+            "mae_censor_cap": test_metrics["mae_censor_cap"],
+            "rmse_censor_cap": test_metrics["rmse_censor_cap"],
+        },
+        "future": {
+            "pearson_censor_cap": future_metrics["pearson_censor_cap"],
+            "spearman_censor_cap": future_metrics["spearman_censor_cap"],
+            "mae_censor_cap": future_metrics["mae_censor_cap"],
+            "rmse_censor_cap": future_metrics["rmse_censor_cap"],
+        },
+    }
+    (outputs_path / "heldout_metrics_summary.json").write_text(
+        json.dumps(heldout_summary, indent=2, sort_keys=True)
+    )
 
     gisaid_csv = Path(args.gisaid_csv) if args.gisaid_csv else storage_path / "data" / "PLANT_epiflu_human_241212.csv"
     if not args.skip_gisaid and gisaid_csv.exists():
@@ -900,7 +1077,7 @@ def main() -> None:
         gisaid_df.to_csv(gisaid_out, index=False)
         print(f"Saved: {gisaid_out}")
 
-    print(f"Saved: {test_csv}")
+    print(f"Saved held-out summaries: {outputs_path / 'heldout_metrics_summary.json'}")
     print(f"Total time: {time.time() - start:.2f} seconds")
 
 
