@@ -78,6 +78,9 @@ class semanticESM(PreTrainedModel):
         SEMANTIC_W_VIRUS_ONLY: float = 0.2,
         CART_W: float = 0.05,
         LG_W: float = 0.0,
+        reference_transform_mode: str = "full",
+        REF_TRANSFORM_W: float = 0.05,
+        REF_SHIFT_W: float = 0.05,
         missing_label_value: float = MISSING_LABEL_VALUE,
         use_lora: bool = True, #False,
         lora_r: int = 16,
@@ -134,6 +137,31 @@ class semanticESM(PreTrainedModel):
             nn.Linear(intermediate_dim, latent_dim),
         )
 
+        self.reference_transform_mode = reference_transform_mode.lower()
+        valid_reference_transform_modes = {"none", "full", "diagonal"}
+        if self.reference_transform_mode not in valid_reference_transform_modes:
+            raise ValueError(
+                "reference_transform_mode must be one of "
+                f"{sorted(valid_reference_transform_modes)}, got "
+                f"{reference_transform_mode!r}."
+            )
+
+        # Optional near-identity transform for the reference/serum-side coordinate.
+        # This allows the reference coordinate system to differ slightly from the
+        # target-virus coordinate system while starting from the original PLANT
+        # behavior: z_r_final = z_r.
+        self.reference_transform = None
+        self.reference_log_scale = None
+        self.reference_shift = None
+        if self.reference_transform_mode == "full":
+            self.reference_transform = nn.Linear(latent_dim, latent_dim, bias=True)
+            with torch.no_grad():
+                self.reference_transform.weight.copy_(torch.eye(latent_dim))
+                self.reference_transform.bias.zero_()
+        elif self.reference_transform_mode == "diagonal":
+            self.reference_log_scale = nn.Parameter(torch.zeros(latent_dim))
+            self.reference_shift = nn.Parameter(torch.zeros(latent_dim))
+
         self.virus_effects = (
             nn.Linear(virus_effects_len, 1, bias=False)
             if virus_effects_len > 0
@@ -162,6 +190,8 @@ class semanticESM(PreTrainedModel):
         self.CSE_W_VIRUS_ONLY = CSE_W_VIRUS_ONLY
         self.SEMANTIC_W_VIRUS_ONLY = SEMANTIC_W_VIRUS_ONLY
         self.LG_W = LG_W
+        self.REF_TRANSFORM_W = REF_TRANSFORM_W
+        self.REF_SHIFT_W = REF_SHIFT_W
         self.embed_scale_factor = float(embed_scale_factor)
         self.missing_label_value = float(missing_label_value)
 
@@ -341,6 +371,65 @@ class semanticESM(PreTrainedModel):
         repel_loss = torch.clamp(margin_global - dists_no_self, min=0.0)
         global_loss = torch.sum(repel_loss * margin_mask) / (margin_mask.sum() + 1e-8)
         return local_loss + global_loss
+
+    def apply_reference_transform(self, reference_latents: torch.Tensor) -> torch.Tensor:
+        """Map shared reference coordinates to the effective reference coordinate space."""
+        if self.reference_transform_mode == "none":
+            return reference_latents
+        if self.reference_transform_mode == "full":
+            if self.reference_transform is None:
+                raise RuntimeError("reference_transform is not initialized.")
+            return self.reference_transform(reference_latents)
+        if self.reference_transform_mode == "diagonal":
+            if self.reference_log_scale is None or self.reference_shift is None:
+                raise RuntimeError("diagonal reference transform is not initialized.")
+            scale = torch.exp(self.reference_log_scale).to(
+                device=reference_latents.device,
+                dtype=reference_latents.dtype,
+            )
+            shift = self.reference_shift.to(
+                device=reference_latents.device,
+                dtype=reference_latents.dtype,
+            )
+            return reference_latents * scale + shift
+        raise RuntimeError(f"Unknown reference_transform_mode: {self.reference_transform_mode}")
+
+    def reference_transform_regularization(
+        self,
+        reference_latents_shared: torch.Tensor,
+        reference_latents_final: torch.Tensor,
+    ) -> torch.Tensor:
+        """Keep the reference coordinate transform close to the shared coordinate system."""
+        if self.reference_transform_mode == "none":
+            return reference_latents_shared.new_tensor(0.0)
+
+        loss = reference_latents_shared.new_tensor(0.0)
+
+        if self.REF_SHIFT_W != 0.0:
+            # Data-scale regularization: penalize how much reference points move.
+            shift_loss = torch.mean((reference_latents_final - reference_latents_shared) ** 2)
+            loss = loss + shift_loss * self.REF_SHIFT_W
+
+        if self.REF_TRANSFORM_W != 0.0:
+            if self.reference_transform_mode == "full":
+                if self.reference_transform is None:
+                    raise RuntimeError("reference_transform is not initialized.")
+                eye = torch.eye(
+                    self.reference_transform.weight.size(0),
+                    device=self.reference_transform.weight.device,
+                    dtype=self.reference_transform.weight.dtype,
+                )
+                transform_loss = torch.mean((self.reference_transform.weight - eye) ** 2)
+            elif self.reference_transform_mode == "diagonal":
+                if self.reference_log_scale is None:
+                    raise RuntimeError("diagonal reference transform is not initialized.")
+                scale = torch.exp(self.reference_log_scale)
+                transform_loss = torch.mean((scale - 1.0) ** 2)
+            else:
+                transform_loss = reference_latents_shared.new_tensor(0.0)
+            loss = loss + transform_loss * self.REF_TRANSFORM_W
+
+        return loss
 
     def custom_loss(
         self,
@@ -549,12 +638,15 @@ class semanticESM(PreTrainedModel):
             input_ids_reference_labeled = input_ids_reference[has_labels_mask]
             attention_mask_reference_labeled = attention_mask_reference[has_labels_mask]
 
-            reference_regressor_out = self.regressor(
+            reference_regressor_out_shared = self.regressor(
                 self.encode_sequence(
                     self.esm_model,
                     input_ids_reference_labeled,
                     attention_mask_reference_labeled,
                 )
+            )
+            reference_regressor_out = self.apply_reference_transform(
+                reference_regressor_out_shared
             )
             if self.CSE_W != 0.0:
                 reference_regressor_out2 = self.regressor(
@@ -565,7 +657,7 @@ class semanticESM(PreTrainedModel):
                     )
                 )
             else:
-                reference_regressor_out2 = reference_regressor_out
+                reference_regressor_out2 = reference_regressor_out_shared
             distance = torch.norm(
                 virus_regressor_out[has_labels_mask] - reference_regressor_out,
                 p=2,
@@ -627,7 +719,7 @@ class semanticESM(PreTrainedModel):
                 censors.to(device)[has_labels_mask].view(-1, 1),
                 virus_regressor_out[has_labels_mask],
                 virus_regressor_out2[has_labels_mask],
-                reference_regressor_out,
+                reference_regressor_out_shared,
                 reference_regressor_out2,
                 virus_embedding_original[has_labels_mask],
                 reference_embedding_original,
@@ -636,6 +728,10 @@ class semanticESM(PreTrainedModel):
             combined_loss = combined_loss + (
                 torch.mean(systematic_error1**2) + torch.mean(systematic_error2**2)
             ) * 1.0e-4
+            combined_loss = combined_loss + self.reference_transform_regularization(
+                reference_regressor_out_shared,
+                reference_regressor_out,
+            )
 
             # Trainer.predict expects batch-aligned outputs.  Virus-only rows get NaN.
             logits = torch.full(
