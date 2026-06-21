@@ -118,6 +118,15 @@ def build_plant_optimizer(
 ) -> AdamW:
     """Create an AdamW optimizer with a separate regressor weight decay."""
     no_decay = ("bias", "LayerNorm.weight", "layer_norm.weight")
+    # These small scalar / near-identity parameters have explicit losses or
+    # learned scaling semantics.  Applying AdamW weight decay would pull them
+    # toward zero rather than toward their intended neutral values.
+    explicit_no_weight_decay = (
+        "embed_scale",
+        "reference_transform",
+        "reference_log_scale",
+        "reference_shift",
+    )
     regressor_params = []
     other_params = []
     for name, param in model.named_parameters():
@@ -135,12 +144,20 @@ def build_plant_optimizer(
         },
         {
             "params": [
-                p for n, p in other_params if not any(nd in n for nd in no_decay)
+                p
+                for n, p in other_params
+                if not any(nd in n for nd in no_decay)
+                and not any(key in n for key in explicit_no_weight_decay)
             ],
             "weight_decay": weight_decay,
         },
         {
-            "params": [p for n, p in other_params if any(nd in n for nd in no_decay)],
+            "params": [
+                p
+                for n, p in other_params
+                if any(nd in n for nd in no_decay)
+                or any(key in n for key in explicit_no_weight_decay)
+            ],
             "weight_decay": 0.0,
         },
     ]

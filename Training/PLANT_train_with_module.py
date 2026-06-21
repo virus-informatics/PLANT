@@ -116,7 +116,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--CSE-alpha", "--CSE_alpha", dest="CSE_alpha", default=0.0, type=float)
     parser.add_argument("--intermediate-dim-encoder", "--intermediate_dim_encoder", dest="intermediate_dim_encoder", default=64, type=int)
     parser.add_argument("--dropout-encoder", "--dropout_encoder", dest="dropout_encoder", default=0.1, type=float)
-    parser.add_argument("--lg-w", "--lg_w", dest="lg_w", default=0.01, type=float)
+    parser.add_argument("--lg-w", "--lg_w", dest="lg_w", default=0.0, type=float)
+    parser.add_argument(
+        "--reference-transform-mode",
+        "--reference_transform_mode",
+        dest="reference_transform_mode",
+        choices=["none", "full", "diagonal"],
+        default="full",
+        help=(
+            "Reference-side coordinate transform. 'full' learns a near-identity "
+            "affine transform, 'diagonal' learns axis-wise scaling plus shift, "
+            "and 'none' restores the shared-coordinate baseline."
+        ),
+    )
+    parser.add_argument(
+        "--ref-transform-w",
+        "--ref_transform_w",
+        dest="ref_transform_w",
+        default=0.05,
+        type=float,
+        help="Weight for keeping the reference transform close to identity.",
+    )
+    parser.add_argument(
+        "--ref-shift-w",
+        "--ref_shift_w",
+        dest="ref_shift_w",
+        default=0.05,
+        type=float,
+        help="Weight for penalizing the data-scale shift of transformed reference points.",
+    )
     parser.add_argument("--no-fp16", action="store_true")
     return parser.parse_args()
 
@@ -350,6 +378,54 @@ def apply_censor_cap(df: pd.DataFrame, censor_col: str, predicted_col: str, scor
     )
 
 
+def _safe_correlation(x, y, *, method: str) -> tuple[float, float, int]:
+    """Return correlation, p-value, and N while tolerating NaNs/constant vectors."""
+    x_arr = np.asarray(x, dtype=float)
+    y_arr = np.asarray(y, dtype=float)
+    ok = np.isfinite(x_arr) & np.isfinite(y_arr)
+    x_arr = x_arr[ok]
+    y_arr = y_arr[ok]
+    n = int(x_arr.size)
+    if n < 3 or np.nanstd(x_arr) == 0 or np.nanstd(y_arr) == 0:
+        return float("nan"), float("nan"), n
+    if method == "pearson":
+        corr, p_value = scipy.stats.pearsonr(x_arr, y_arr)
+    elif method == "spearman":
+        corr, p_value = scipy.stats.spearmanr(x_arr, y_arr)
+    else:
+        raise ValueError(f"Unknown correlation method: {method}")
+    return float(corr), float(p_value), n
+
+
+def write_prediction_correlations(df: pd.DataFrame, output_path: Path) -> None:
+    """Write Pearson and Spearman correlations for all prediction columns."""
+    prediction_columns = [
+        "predicted_dist",
+        "predicted_dist_censor_cap",
+        "predicted_dist_cartography",
+        "predicted_dist_cartography_censor_cap",
+    ]
+    lines = []
+    for col in prediction_columns:
+        if col not in df.columns:
+            continue
+        pearson_r, pearson_p, pearson_n = _safe_correlation(df["score"], df[col], method="pearson")
+        spearman_r, spearman_p, spearman_n = _safe_correlation(df["score"], df[col], method="spearman")
+        lines.extend(
+            [
+                f"[{col}]",
+                f"pearson_r\t{pearson_r:.8g}",
+                f"pearson_p\t{pearson_p:.8g}",
+                f"pearson_n\t{pearson_n}",
+                f"spearman_r\t{spearman_r:.8g}",
+                f"spearman_p\t{spearman_p:.8g}",
+                f"spearman_n\t{spearman_n}",
+                "",
+            ]
+        )
+    output_path.write_text("\n".join(lines))
+
+
 def main() -> None:
     start = time.time()
     args = parse_args()
@@ -358,6 +434,17 @@ def main() -> None:
     storage_path = Path(args.directory).resolve()
     outputs_path = storage_path / "Season_based_split_performance" / args.prefix / "trained_until_full"
     outputs_path.mkdir(parents=True, exist_ok=True)
+
+    bf16 = (
+        (not args.no_fp16)
+        and torch.cuda.is_available()
+        and torch.cuda.is_bf16_supported()
+    )
+    fp16 = (
+        (not args.no_fp16)
+        and torch.cuda.is_available()
+        and not bf16
+    )
 
     paired_csv = Path(args.paired_csv) if args.paired_csv else storage_path / "data" / "WHO_GISAID_dataset_final_strict_score_250124.csv"
     sequence_pool_fasta = (
@@ -373,6 +460,13 @@ def main() -> None:
 
     print(f"Model: {args.model}")
     print(f"Output: {outputs_path}")
+    print(f"Mixed precision: bf16={bf16}, fp16={fp16}")
+    print(
+        "Reference transform: "
+        f"mode={args.reference_transform_mode}, "
+        f"REF_TRANSFORM_W={args.ref_transform_w}, "
+        f"REF_SHIFT_W={args.ref_shift_w}"
+    )
     print("Loading paired antigenic-distance data...")
     selected_df = clean_paired_dataset(paired_csv, args.max_length, args.random_seed)
     selected_df_train_val, selected_df_test = split_dataframe_with_stratified_group_kfold(
@@ -431,7 +525,8 @@ def main() -> None:
         dataset_train,
         esm_model_name=args.model,
         batch_size=args.embedding_batch_size,
-        use_fp16=not args.no_fp16,
+        use_bf16=bf16,
+        use_fp16=fp16,
     )
     selected_df_train = selected_df_train.copy()
     selected_df_train["embed_dist"] = embed_dist_train
@@ -443,7 +538,8 @@ def main() -> None:
         dataset_test,
         esm_model_name=args.model,
         batch_size=args.embedding_batch_size,
-        use_fp16=not args.no_fp16,
+        use_bf16=bf16,
+        use_fp16=fp16,
     )
     selected_df_test = selected_df_test.copy()
     selected_df_test["embed_dist"] = embed_dist_test
@@ -468,6 +564,9 @@ def main() -> None:
         intermediate_dim_encoder=args.intermediate_dim_encoder,
         CSE_ALPHA=args.CSE_alpha,
         LG_W=args.lg_w,
+        reference_transform_mode=args.reference_transform_mode,
+        REF_TRANSFORM_W=args.ref_transform_w,
+        REF_SHIFT_W=args.ref_shift_w,
     )
 
     optimizer = build_plant_optimizer(
@@ -477,13 +576,13 @@ def main() -> None:
         regressor_weight_decay=args.reg_weight_decay,
     )
 
-    fp16 = (not args.no_fp16) and torch.cuda.is_available()
     training_args = make_training_args(
         output_dir=str(outputs_path / "results"),
         max_steps=args.num_steps,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.eval_batch_size,
         gradient_accumulation_steps=1,
+        bf16=bf16,
         fp16=fp16,
         save_strategy="steps",
         save_steps=args.save_steps,
@@ -519,6 +618,19 @@ def main() -> None:
     trainer.save_model(str(final_model_dir))
     tokenizer.save_pretrained(str(final_model_dir))
 
+    run_config = vars(args).copy()
+    run_config.update(
+        {
+            "bf16": bf16,
+            "fp16": fp16,
+            "embed_scale_factor": embed_scale_factor,
+            "model_dir": str(final_model_dir),
+        }
+    )
+    (outputs_path / "training_config.json").write_text(
+        json.dumps(run_config, indent=2, sort_keys=True)
+    )
+
     print("Predicting held-out test data...")
     predictions = trainer.predict(dataset_test)
     logits = predictions.predictions[0] if isinstance(predictions.predictions, tuple) else predictions.predictions
@@ -542,10 +654,15 @@ def main() -> None:
 
     test_csv = outputs_path / "test_df_full.csv"
     selected_df_test.to_csv(test_csv, index=False)
-    corr, p_value = scipy.stats.pearsonr(
-        selected_df_test["score"], selected_df_test["predicted_dist_censor_cap"]
+    corr_file = outputs_path / "test_prediction_correlations.txt"
+    write_prediction_correlations(selected_df_test, corr_file)
+    corr, p_value, corr_n = _safe_correlation(
+        selected_df_test["score"],
+        selected_df_test["predicted_dist_censor_cap"],
+        method="pearson",
     )
-    print(f"Pearson correlation: {corr:.4f} (p-value: {p_value:.4g})")
+    print(f"Pearson correlation: {corr:.4f} (p-value: {p_value:.4g}, n={corr_n})")
+    print(f"Saved correlations: {corr_file}")
 
     gisaid_csv = Path(args.gisaid_csv) if args.gisaid_csv else storage_path / "data" / "PLANT_epiflu_human_241212.csv"
     if not args.skip_gisaid and gisaid_csv.exists():
@@ -564,9 +681,16 @@ def main() -> None:
         dataloader_gisaid = DataLoader(dataset_gisaid, batch_size=64, shuffle=False)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         trainer.model.to(device)
-        if fp16:
+        if bf16:
+            trainer.model.bfloat16()
+        elif fp16:
             trainer.model.half()
-        coords = embed_sequences(trainer.model, dataloader_gisaid, use_fp16=fp16)
+        coords = embed_sequences(
+            trainer.model,
+            dataloader_gisaid,
+            use_bf16=bf16,
+            use_fp16=fp16,
+        )
         gisaid_df["z1"] = coords[:, 0]
         gisaid_df["z2"] = coords[:, 1]
         gisaid_df["z3"] = coords[:, 2]
