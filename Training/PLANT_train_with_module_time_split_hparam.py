@@ -149,7 +149,7 @@ def parse_args() -> argparse.Namespace:
         "--time-cutoff-date",
         "--time_cutoff_date",
         dest="time_cutoff_date",
-        default="2024-01-31",
+        default="2022-08-31",
         help=(
             "Cutoff date for past/future evaluation split based on the paired-data "
             "'date' column. Rows with resolved dates <= cutoff are used for the "
