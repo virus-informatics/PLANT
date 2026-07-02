@@ -856,7 +856,7 @@ def main() -> None:
 
     print("Loading virus-only sequence pool...")
     sequence_pool_df = load_sequence_pool(sequence_pool_fasta, sequence_pool_metadata)
-    sequence_pool_df = sequence_pool_df[sequence_pool_df["seq"].str.len() == args.max_length].reset_index(drop=True)
+    sequence_pool_df = sequence_pool_df.reset_index(drop=True)
     print(f"Virus-only sequence pool size: {len(sequence_pool_df)}")
 
     print("Tokenizing sequences...")
