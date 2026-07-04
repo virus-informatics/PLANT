@@ -74,9 +74,9 @@ class BalancedCombinationSampler(Sampler[int]):
             return sampled_indices
         return list(range(offset, offset + len(dataset)))
 
-    def _sample_indices_for_epoch(self) -> list[int]:
+    def _sample_indices_for_epoch(self, epoch: int) -> list[int]:
         generator = torch.Generator()
-        generator.manual_seed(self.seed + self.epoch)
+        generator.manual_seed(self.seed + epoch)
 
         if isinstance(self.dataset, ConcatDataset):
             sampled_indices: list[int] = []
@@ -100,9 +100,22 @@ class BalancedCombinationSampler(Sampler[int]):
         return sampled_indices
 
     def __iter__(self):
-        sampled_indices = self._sample_indices_for_epoch()
-        self.epoch += 1
+        # DataLoader calls sampler.__iter__() whenever a new pass over the
+        # dataloader starts.  With Trainer, that is effectively once per epoch.
+        current_epoch = self.epoch
+        sampled_indices = self._sample_indices_for_epoch(current_epoch)
+        self.epoch = current_epoch + 1
         return iter(sampled_indices)
+
+    def set_epoch(self, epoch: int) -> None:
+        """Set the epoch explicitly when a training loop/accelerator supports it."""
+        self.epoch = int(epoch)
+
+    def state_dict(self) -> dict[str, int]:
+        return {"epoch": self.epoch}
+
+    def load_state_dict(self, state_dict: dict[str, int]) -> None:
+        self.epoch = int(state_dict.get("epoch", 0))
 
     def __len__(self) -> int:
         if isinstance(self.dataset, ConcatDataset):
