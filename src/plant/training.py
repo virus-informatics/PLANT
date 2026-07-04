@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import random
 from contextlib import nullcontext
 from typing import Optional
 
@@ -10,7 +9,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
-from torch.utils.data import BatchSampler, ConcatDataset, DataLoader, RandomSampler, Subset
+from torch.utils.data import BatchSampler, ConcatDataset, DataLoader, Sampler
 from transformers import AutoModel, EsmConfig, PreTrainedModel, Trainer
 from transformers.utils import ModelOutput
 
@@ -35,26 +34,29 @@ def _mixed_precision_dtype(
     return None
 
 
-class BalancedCombinationTrainer(Trainer):
-    """Trainer that samples at most N examples per experimental combination.
+class BalancedCombinationSampler(Sampler[int]):
+    """Sample at most N examples per experimental combination at each epoch.
 
-    The original training script balanced repeated HI/antigenic-distance
-    measurements by drawing one row per unique combination at each epoch.  This
-    implementation keeps that behavior and correctly handles ``ConcatDataset``
-    offsets when paired and virus-only datasets are mixed.
+    The sampled index list is rebuilt every time ``__iter__`` is called.  In the
+    Hugging Face Trainer training loop, this corresponds to rebuilding the
+    sampled replicate set at the start of each epoch.
     """
 
     def __init__(
         self,
-        *args,
+        dataset,
+        *,
         num_samples_per_combination: int = 1,
-        random_seed: Optional[int] = None,
-        **kwargs,
+        seed: int = 0,
+        shuffle: bool = True,
     ) -> None:
-        super().__init__(*args, **kwargs)
+        if num_samples_per_combination < 1:
+            raise ValueError("num_samples_per_combination must be >= 1")
+        self.dataset = dataset
         self.num_samples_per_combination = num_samples_per_combination
-        self.random_seed = 0 if random_seed is None else random_seed
-        self._epoch_for_sampling = 0
+        self.seed = seed
+        self.shuffle = shuffle
+        self.epoch = 0
 
     def _sample_dataset_indices(self, dataset, offset: int, generator: torch.Generator):
         if hasattr(dataset, "get_unique_combinations_indices"):
@@ -72,42 +74,94 @@ class BalancedCombinationTrainer(Trainer):
             return sampled_indices
         return list(range(offset, offset + len(dataset)))
 
-    def get_train_dataloader(self):
-        train_dataset = self.train_dataset
+    def _sample_indices_for_epoch(self) -> list[int]:
         generator = torch.Generator()
-        generator.manual_seed(self.random_seed + self._epoch_for_sampling)
-        random.seed(self.random_seed + self._epoch_for_sampling)
-        torch.manual_seed(self.random_seed + self._epoch_for_sampling)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(self.random_seed + self._epoch_for_sampling)
-        self._epoch_for_sampling += 1
+        generator.manual_seed(self.seed + self.epoch)
 
-        if isinstance(train_dataset, ConcatDataset):
-            subsampled_indices: list[int] = []
+        if isinstance(self.dataset, ConcatDataset):
+            sampled_indices: list[int] = []
             offset = 0
-            for dataset in train_dataset.datasets:
-                subsampled_indices.extend(
+            for dataset in self.dataset.datasets:
+                sampled_indices.extend(
                     self._sample_dataset_indices(dataset, offset, generator)
                 )
                 offset += len(dataset)
         else:
-            subsampled_indices = self._sample_dataset_indices(train_dataset, 0, generator)
+            sampled_indices = self._sample_dataset_indices(
+                self.dataset,
+                offset=0,
+                generator=generator,
+            )
 
-        subsampled_dataset = Subset(train_dataset, subsampled_indices)
-        sampler = RandomSampler(subsampled_dataset, generator=generator)
+        if self.shuffle:
+            perm = torch.randperm(len(sampled_indices), generator=generator).tolist()
+            sampled_indices = [sampled_indices[i] for i in perm]
+
+        return sampled_indices
+
+    def __iter__(self):
+        sampled_indices = self._sample_indices_for_epoch()
+        self.epoch += 1
+        return iter(sampled_indices)
+
+    def __len__(self) -> int:
+        if isinstance(self.dataset, ConcatDataset):
+            total = 0
+            for dataset in self.dataset.datasets:
+                total += self._sampled_length(dataset)
+            return total
+        return self._sampled_length(self.dataset)
+
+    def _sampled_length(self, dataset) -> int:
+        if hasattr(dataset, "get_unique_combinations_indices"):
+            unique_combinations = dataset.get_unique_combinations_indices()
+            return sum(
+                min(len(indices), self.num_samples_per_combination)
+                for indices in unique_combinations.values()
+            )
+        return len(dataset)
+
+
+class BalancedCombinationTrainer(Trainer):
+    """Trainer that samples at most N examples per experimental combination.
+
+    Paired HI/antigenic-distance examples are balanced by drawing one row per
+    unique experimental combination at each epoch.  This implementation keeps
+    ``ConcatDataset`` support while avoiding a fixed ``Subset`` so that repeated
+    measurements can be resampled across epochs.
+    """
+
+    def __init__(
+        self,
+        *args,
+        num_samples_per_combination: int = 1,
+        random_seed: Optional[int] = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.num_samples_per_combination = num_samples_per_combination
+        self.random_seed = 0 if random_seed is None else random_seed
+
+    def get_train_dataloader(self):
+        train_dataset = self.train_dataset
+        sampler = BalancedCombinationSampler(
+            train_dataset,
+            num_samples_per_combination=self.num_samples_per_combination,
+            seed=self.random_seed,
+            shuffle=True,
+        )
         batch_sampler = BatchSampler(
             sampler,
             self.args.train_batch_size,
             drop_last=self.args.dataloader_drop_last,
         )
         return DataLoader(
-            subsampled_dataset,
+            train_dataset,
             batch_sampler=batch_sampler,
             collate_fn=self.data_collator,
             num_workers=self.args.dataloader_num_workers,
             pin_memory=self.args.dataloader_pin_memory,
         )
-
 
 def build_plant_optimizer(
     model: nn.Module,
