@@ -18,6 +18,7 @@ import calendar
 import datetime as dt
 import json
 import random
+import re
 import sys
 import time
 from pathlib import Path
@@ -228,17 +229,37 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument(
-        "--time-cutoff-date",
-        "--time_cutoff_date",
-        dest="time_cutoff_date",
-        default="2022-08-31",
+        "--split-mode",
+        "--split_mode",
+        dest="split_mode",
+        choices=["season", "full"],
+        default="season",
         help=(
-            "Cutoff date for past/future evaluation split based on the paired-data "
-            "'date' column. Rows with resolved dates <= cutoff are used for the "
-            "random train/validation/test split; rows after cutoff are held out "
-            "as the future dataset. Incomplete dates are resolved conservatively "
-            "to the latest possible date."
+            "How to construct train/validation/test/future splits. "
+            "'season' uses --cutoff-season to hold out later seasons as a future set. "
+            "'full' uses all seasons for the random train/validation/test split and "
+            "does not create or evaluate a future dataset."
         ),
+    )
+    parser.add_argument(
+        "--cutoff-season",
+        "--cutoff_season",
+        dest="cutoff_season",
+        default="NH2022",
+        help=(
+            "Cutoff season for past/future evaluation split based on the paired-data "
+            "season column. Used only when --split-mode season. Examples: NH2014 or "
+            "SH2014. Rows with season <= cutoff are used for the random "
+            "train/validation/test split; later seasons are held out as the future "
+            "dataset. Season order is ... SH2013, NH2014, SH2014, NH2015, ..."
+        ),
+    )
+    parser.add_argument(
+        "--season-col",
+        "--season_col",
+        dest="season_col",
+        default="season",
+        help="Column name in the paired CSV containing season labels such as NH2014 or SH2014.",
     )
     parser.add_argument(
         "--virus-only-ratio-k",
@@ -372,39 +393,106 @@ def resolve_partial_date_for_time_split(date_value) -> pd.Timestamp:
     return pd.Timestamp(year=year, month=month, day=day)
 
 
-def split_past_future_by_cutoff(
+_SEASON_RE_NH_SH_FIRST = re.compile(r"^\s*(NH|SH)\s*[-_/ ]?\s*(\d{4})\s*$", re.IGNORECASE)
+_SEASON_RE_YEAR_FIRST = re.compile(r"^\s*(\d{4})\s*[-_/ ]?\s*(NH|SH)\s*$", re.IGNORECASE)
+
+
+def parse_season_label(season_value) -> tuple[str, int]:
+    """Parse a season label and return a normalized label plus sortable order.
+
+    The order follows the antigenic-assay convention requested for PLANT:
+    ``... SH2013 < NH2014 < SH2014 < NH2015 ...``. Thus ``NHYYYY`` is encoded
+    as ``YYYY * 2`` and ``SHYYYY`` as ``YYYY * 2 + 1``.
+    """
+    if pd.isna(season_value):
+        raise ValueError("Season label is missing.")
+
+    raw = str(season_value).strip().upper()
+    match = _SEASON_RE_NH_SH_FIRST.match(raw)
+    if match:
+        hemisphere, year_str = match.groups()
+    else:
+        match = _SEASON_RE_YEAR_FIRST.match(raw)
+        if not match:
+            raise ValueError(
+                f"Could not parse season label {season_value!r}. "
+                "Expected labels such as NH2014, SH2014, 2014NH, or 2014SH."
+            )
+        year_str, hemisphere = match.groups()
+        hemisphere = hemisphere.upper()
+
+    year = int(year_str)
+    normalized = f"{hemisphere}{year:04d}"
+    order = year * 2 + (1 if hemisphere == "SH" else 0)
+    return normalized, order
+
+
+def season_order_to_label(order: int) -> str:
+    """Convert a sortable season order back to a normalized season label."""
+    order = int(order)
+    if order % 2 == 0:
+        return f"NH{order // 2:04d}"
+    return f"SH{(order - 1) // 2:04d}"
+
+
+def add_season_order_columns(df: pd.DataFrame, *, season_col: str = "season") -> pd.DataFrame:
+    """Add normalized season and sortable season-order columns."""
+    out = df.copy()
+    parsed_labels: list[str | None] = []
+    parsed_orders: list[float] = []
+    invalid_values = []
+
+    for value in out[season_col]:
+        try:
+            normalized, order = parse_season_label(value)
+        except ValueError:
+            parsed_labels.append(None)
+            parsed_orders.append(np.nan)
+            invalid_values.append(value)
+        else:
+            parsed_labels.append(normalized)
+            parsed_orders.append(order)
+
+    out["season_normalized"] = parsed_labels
+    out["season_order"] = parsed_orders
+
+    invalid = out["season_order"].isna()
+    if invalid.any():
+        examples = sorted({str(v) for v in invalid_values})[:10]
+        print(
+            "Dropping rows with unparseable season values for season split: "
+            f"{int(invalid.sum())}. Examples: {examples}"
+        )
+        out = out.loc[~invalid].copy()
+
+    out["season_order"] = out["season_order"].astype(int)
+    return out
+
+
+def split_past_future_by_cutoff_season(
     df: pd.DataFrame,
     *,
-    cutoff_date: str,
-    date_col: str = "date",
+    cutoff_season: str,
+    season_col: str = "season",
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Split paired data into past and future sets using a cutoff date.
+    """Split paired data into past/future sets using ordered NH/SH seasons.
 
-    Rows with resolved dates <= cutoff are assigned to the past set.  Rows with
-    resolved dates > cutoff are assigned to the future set.
+    Example: cutoff_season="NH2014" assigns seasons up to and including NH2014
+    to the past set, while SH2014 and later seasons are held out as future data.
     """
-    cutoff = pd.Timestamp(cutoff_date)
-    out = df.copy()
-    out["date_for_time_split"] = out[date_col].apply(resolve_partial_date_for_time_split)
+    cutoff_normalized, cutoff_order = parse_season_label(cutoff_season)
+    out = add_season_order_columns(df, season_col=season_col)
 
-    unparseable = out["date_for_time_split"].isna()
-    if unparseable.any():
-        print(
-            "Dropping rows with unparseable date values for time split: "
-            f"{int(unparseable.sum())}"
-        )
-        out = out.loc[~unparseable].copy()
-
-    past = out.loc[out["date_for_time_split"] <= cutoff].copy()
-    future = out.loc[out["date_for_time_split"] > cutoff].copy()
+    past = out.loc[out["season_order"] <= cutoff_order].copy()
+    future = out.loc[out["season_order"] > cutoff_order].copy()
 
     if past.empty:
         raise ValueError(
-            f"No rows were assigned to the past set using cutoff_date={cutoff_date!r}."
+            f"No rows were assigned to the past set using cutoff_season={cutoff_normalized!r}."
         )
     if future.empty:
         raise ValueError(
-            f"No rows were assigned to the future set using cutoff_date={cutoff_date!r}."
+            f"No rows were assigned to the future set using cutoff_season={cutoff_normalized!r}."
         )
 
     return past.reset_index(drop=True), future.reset_index(drop=True)
@@ -544,10 +632,21 @@ def sample_virus_only_pool(
     return sampled_df
 
 
-def clean_paired_dataset(path: Path, max_length: int, seed: int) -> pd.DataFrame:
+def clean_paired_dataset(
+    path: Path,
+    max_length: int,
+    seed: int,
+    *,
+    season_col: str = "season",
+) -> pd.DataFrame:
     df = pd.read_csv(path)
+    if season_col != "season":
+        if season_col not in df.columns:
+            raise ValueError(f"Missing requested season column in {path}: {season_col!r}")
+        df = df.rename(columns={season_col: "season"})
     required_cols = [
         "date",
+        "season",
         "virus",
         "reference",
         "virus_passage",
@@ -949,6 +1048,97 @@ def write_prediction_metrics(df: pd.DataFrame, output_path: Path) -> None:
 
 
 
+def _json_safe_value(value):
+    """Convert numpy scalars and non-finite floats into JSON-friendly values."""
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        value = float(value)
+    if isinstance(value, float) and not np.isfinite(value):
+        return None
+    return value
+
+
+def compute_prediction_metrics_by_season(
+    df: pd.DataFrame,
+    *,
+    season_col: str = "season_normalized",
+) -> pd.DataFrame:
+    """Compute prediction metrics separately for each future season."""
+    if season_col not in df.columns:
+        raise ValueError(f"Missing season column for per-season metrics: {season_col!r}")
+
+    rows = []
+    sort_cols = [season_col]
+    if "season_order" in df.columns:
+        sort_cols = ["season_order", season_col]
+
+    for season, group in df.sort_values(sort_cols).groupby(season_col, sort=False):
+        metrics = compute_prediction_metrics_from_dataframe(group)
+        row = {"season": season, "n": int(len(group))}
+        if "season_order" in group.columns:
+            row["season_order"] = int(group["season_order"].iloc[0])
+        row.update(metrics)
+        rows.append(row)
+
+    metrics_df = pd.DataFrame(rows)
+    if not metrics_df.empty and "season_order" in metrics_df.columns:
+        metrics_df = metrics_df.sort_values(["season_order", "season"]).reset_index(drop=True)
+    return metrics_df
+
+
+def write_future_metrics_by_season(
+    df: pd.DataFrame,
+    outputs_path: Path,
+    *,
+    season_col: str = "season_normalized",
+) -> tuple[pd.DataFrame, dict[str, dict[str, object]]]:
+    """Save future-set metrics computed independently for each season."""
+    metrics_df = compute_prediction_metrics_by_season(df, season_col=season_col)
+
+    csv_path = outputs_path / "future_prediction_metrics_by_season.csv"
+    metrics_df.to_csv(csv_path, index=False)
+
+    json_ready = {}
+    for _, row in metrics_df.iterrows():
+        season = row["season"]
+        json_ready[str(season)] = {
+            str(key): _json_safe_value(value)
+            for key, value in row.items()
+            if key != "season"
+        }
+
+    json_path = outputs_path / "future_prediction_metrics_by_season.json"
+    json_path.write_text(json.dumps(json_ready, indent=2, sort_keys=True))
+
+    txt_path = outputs_path / "future_prediction_metrics_by_season.txt"
+    lines = []
+    for _, row in metrics_df.iterrows():
+        lines.append(f"[{row['season']}] n={int(row['n'])}")
+        for col in PREDICTION_COLUMNS:
+            pearson_key = f"pearson_{col}"
+            if pearson_key not in row:
+                continue
+            lines.extend(
+                [
+                    f"  {col}",
+                    f"    pearson_r	{row[f'pearson_{col}']:.8g}",
+                    f"    pearson_n	{int(row[f'pearson_n_{col}'])}",
+                    f"    spearman_r	{row[f'spearman_{col}']:.8g}",
+                    f"    spearman_n	{int(row[f'spearman_n_{col}'])}",
+                    f"    mae	{row[f'mae_{col}']:.8g}",
+                    f"    rmse	{row[f'rmse_{col}']:.8g}",
+                ]
+            )
+        lines.append("")
+    txt_path.write_text("\n".join(lines))
+
+    print(f"Saved future per-season metrics: {csv_path}")
+    print(f"Saved future per-season metrics JSON: {json_path}")
+    print(f"Saved future per-season metrics text: {txt_path}")
+    return metrics_df, json_ready
+
+
 def predict_and_save_split(
     trainer: BalancedCombinationTrainer,
     dataset: TextDataset,
@@ -1000,7 +1190,11 @@ def main() -> None:
     set_seed(args.random_seed)
 
     storage_path = Path(args.directory).resolve()
-    outputs_path = storage_path / "Season_based_split_performance" / args.prefix / "trained_until_full"
+    if args.split_mode == "season":
+        output_split_label = f"trained_until_{parse_season_label(args.cutoff_season)[0]}"
+    else:
+        output_split_label = "full_model"
+    outputs_path = storage_path / "Season_based_split_performance" / args.prefix / output_split_label
     outputs_path.mkdir(parents=True, exist_ok=True)
 
     bf16 = (
@@ -1036,20 +1230,36 @@ def main() -> None:
         f"REF_SHIFT_W={args.ref_shift_w}"
     )
     print("Loading paired antigenic-distance data...")
-    selected_df = clean_paired_dataset(paired_csv, args.max_length, args.random_seed)
-    selected_df_past, selected_df_future = split_past_future_by_cutoff(
-        selected_df,
-        cutoff_date=args.time_cutoff_date,
-        date_col="date",
+    selected_df = clean_paired_dataset(
+        paired_csv,
+        args.max_length,
+        args.random_seed,
+        season_col=args.season_col,
     )
+    selected_df_with_season = add_season_order_columns(selected_df, season_col="season")
+
+    if args.split_mode == "season":
+        selected_df_past, selected_df_future = split_past_future_by_cutoff_season(
+            selected_df,
+            cutoff_season=args.cutoff_season,
+            season_col="season",
+        )
+        has_future = True
+    elif args.split_mode == "full":
+        selected_df_past = selected_df_with_season.reset_index(drop=True)
+        selected_df_future = None
+        has_future = False
+    else:  # Defensive guard in case argparse choices are bypassed.
+        raise ValueError(f"Unknown split_mode: {args.split_mode!r}")
 
     selected_df_train_val, selected_df_test = split_dataframe_with_stratified_group_kfold(
         selected_df_past, train_ratio=0.8, seed=args.random_seed
     )
     selected_df_test = selected_df_test.copy()
     selected_df_test["weight"] = 1.0
-    selected_df_future = selected_df_future.copy()
-    selected_df_future["weight"] = 1.0
+    if has_future:
+        selected_df_future = selected_df_future.copy()
+        selected_df_future["weight"] = 1.0
 
     selected_df_train_val = add_density_weights(selected_df_train_val)
     selected_df_train, selected_df_val = split_dataframe_with_stratified_group_kfold(
@@ -1057,18 +1267,36 @@ def main() -> None:
     )
 
     split_summary = {
-        "time_cutoff_date": args.time_cutoff_date,
-        "all_after_cleaning": len(selected_df),
+        "split_mode": args.split_mode,
+        "cutoff_season": parse_season_label(args.cutoff_season)[0] if args.split_mode == "season" else None,
+        "season_col": args.season_col,
+        "season_order_convention": "... SH2013 < NH2014 < SH2014 < NH2015 ...",
+        "all_after_cleaning": len(selected_df_with_season),
         "past_total": len(selected_df_past),
-        "future": len(selected_df_future),
+        "future": len(selected_df_future) if has_future else 0,
         "train": len(selected_df_train),
         "validation": len(selected_df_val),
         "test": len(selected_df_test),
-        "past_min_date": str(selected_df_past["date_for_time_split"].min().date()),
-        "past_max_date": str(selected_df_past["date_for_time_split"].max().date()),
-        "future_min_date": str(selected_df_future["date_for_time_split"].min().date()),
-        "future_max_date": str(selected_df_future["date_for_time_split"].max().date()),
+        "past_min_season": season_order_to_label(selected_df_past["season_order"].min()),
+        "past_max_season": season_order_to_label(selected_df_past["season_order"].max()),
+        "past_seasons": sorted(selected_df_past["season_normalized"].unique().tolist(), key=lambda s: parse_season_label(s)[1]),
     }
+    if has_future:
+        split_summary.update(
+            {
+                "future_min_season": season_order_to_label(selected_df_future["season_order"].min()),
+                "future_max_season": season_order_to_label(selected_df_future["season_order"].max()),
+                "future_seasons": sorted(selected_df_future["season_normalized"].unique().tolist(), key=lambda s: parse_season_label(s)[1]),
+            }
+        )
+    else:
+        split_summary.update(
+            {
+                "future_min_season": None,
+                "future_max_season": None,
+                "future_seasons": [],
+            }
+        )
     print(json.dumps(split_summary, indent=2))
     (outputs_path / "split_summary.json").write_text(
         json.dumps(split_summary, indent=2, sort_keys=True)
@@ -1092,7 +1320,7 @@ def main() -> None:
     dataset_train = make_paired_dataset(selected_df_train, tokenizer, args.max_length)
     dataset_val = make_paired_dataset(selected_df_val, tokenizer, args.max_length)
     dataset_test = make_paired_dataset(selected_df_test, tokenizer, args.max_length)
-    dataset_future = make_paired_dataset(selected_df_future, tokenizer, args.max_length)
+    dataset_future = make_paired_dataset(selected_df_future, tokenizer, args.max_length) if has_future else None
     dataset_virus_only = make_virus_only_dataset(sequence_pool_df, tokenizer, args.max_length)
     dataset_train_combined = ConcatDataset([dataset_train, dataset_virus_only])
 
@@ -1137,15 +1365,16 @@ def main() -> None:
     selected_df_test = selected_df_test.copy()
     selected_df_test["embed_dist"] = embed_dist_test
 
-    embed_dist_future = compute_embedding_distances(
-        dataset_future,
-        esm_model_name=args.model,
-        batch_size=args.embedding_batch_size,
-        use_bf16=bf16,
-        use_fp16=fp16,
-    )
-    selected_df_future = selected_df_future.copy()
-    selected_df_future["embed_dist"] = embed_dist_future
+    if has_future:
+        embed_dist_future = compute_embedding_distances(
+            dataset_future,
+            esm_model_name=args.model,
+            batch_size=args.embedding_batch_size,
+            use_bf16=bf16,
+            use_fp16=fp16,
+        )
+        selected_df_future = selected_df_future.copy()
+        selected_df_future["embed_dist"] = embed_dist_future
 
     print("Building PLANT model...")
     esm_config = EsmConfig.from_pretrained(args.model, use_safetensors=True)
@@ -1254,27 +1483,48 @@ def main() -> None:
         outputs_path,
         split_name="test",
     )
-    selected_df_future, future_metrics = predict_and_save_split(
-        trainer,
-        dataset_future,
-        selected_df_future,
-        outputs_path,
-        split_name="future",
-    )
+
     heldout_summary = {
+        "split_mode": args.split_mode,
         "test": {
             "pearson_censor_cap": test_metrics["pearson_censor_cap"],
             "spearman_censor_cap": test_metrics["spearman_censor_cap"],
             "mae_censor_cap": test_metrics["mae_censor_cap"],
             "rmse_censor_cap": test_metrics["rmse_censor_cap"],
         },
-        "future": {
+    }
+
+    if has_future:
+        selected_df_future, future_metrics = predict_and_save_split(
+            trainer,
+            dataset_future,
+            selected_df_future,
+            outputs_path,
+            split_name="future",
+        )
+        _future_season_metrics_df, future_season_metrics = write_future_metrics_by_season(
+            selected_df_future,
+            outputs_path,
+            season_col="season_normalized",
+        )
+        heldout_summary["future"] = {
             "pearson_censor_cap": future_metrics["pearson_censor_cap"],
             "spearman_censor_cap": future_metrics["spearman_censor_cap"],
             "mae_censor_cap": future_metrics["mae_censor_cap"],
             "rmse_censor_cap": future_metrics["rmse_censor_cap"],
-        },
-    }
+        }
+        heldout_summary["future_by_season"] = {
+            season: {
+                "n": values.get("n"),
+                "pearson_censor_cap": values.get("pearson_censor_cap"),
+                "spearman_censor_cap": values.get("spearman_censor_cap"),
+                "mae_censor_cap": values.get("mae_censor_cap"),
+                "rmse_censor_cap": values.get("rmse_censor_cap"),
+            }
+            for season, values in future_season_metrics.items()
+        }
+    else:
+        print("Full split mode selected: skipping future prediction and per-season future metrics.")
     (outputs_path / "heldout_metrics_summary.json").write_text(
         json.dumps(heldout_summary, indent=2, sort_keys=True)
     )
@@ -1293,7 +1543,7 @@ def main() -> None:
         gisaid_df = gisaid_df[gisaid_df["seq"].str.len() == args.max_length].reset_index(drop=True)
         encodes_gisaid = tokenize_sequences(gisaid_df["seq"].tolist(), tokenizer, args.max_length)
         dataset_gisaid = TextDataset(encodes_gisaid)
-        dataloader_gisaid = DataLoader(dataset_gisaid, batch_size=64, shuffle=False)
+        dataloader_gisaid = DataLoader(dataset_gisaid, batch_size=args.embedding_batch_size, shuffle=False)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         trainer.model.to(device)
         if bf16:
