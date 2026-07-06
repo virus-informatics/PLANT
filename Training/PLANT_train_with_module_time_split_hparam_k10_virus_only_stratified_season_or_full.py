@@ -656,7 +656,7 @@ def clean_paired_dataset(
         "virus_seq",
         "reference_seq",
         "virus_collection_date",
-        "reference_collection_date",
+        #"reference_collection_date",
     ]
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
