@@ -51,6 +51,20 @@ from plant import (  # noqa: E402
 )
 
 
+def str2bool(value) -> bool:
+    """Parse common string forms of booleans for argparse."""
+    if isinstance(value, bool):
+        return value
+    value = str(value).strip().lower()
+    if value in {"true", "1", "yes", "y", "on"}:
+        return True
+    if value in {"false", "0", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(
+        f"Expected a boolean value such as true/false, got {value!r}."
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="PLANT trainer",
@@ -145,14 +159,27 @@ def parse_args() -> argparse.Namespace:
         type=float,
         help="Weight for penalizing the data-scale shift of transformed reference points.",
     )
-    parser.add_argument(
+    lora_group = parser.add_mutually_exclusive_group()
+    lora_group.add_argument(
         "--use-lora",
         "--use_lora",
         dest="use_lora",
-        default=True,
-        type=bool,
-        help="Whether to use LoRA adapters for the ESM model.",
+        nargs="?",
+        const=True,
+        type=str2bool,
+        help=(
+            "Use LoRA adapters for the ESM model. This is the default. "
+            "Accepts optional true/false for backward-compatible CLI usage."
+        ),
     )
+    lora_group.add_argument(
+        "--no-use-lora",
+        "--no_use_lora",
+        dest="use_lora",
+        action="store_false",
+        help="Disable LoRA adapters and use full fine-tuning mode.",
+    )
+    parser.set_defaults(use_lora=True)
     parser.add_argument(
         "--lora-r",
         "--lora_r",
@@ -235,6 +262,17 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def parse_lora_target_modules(value: str | None) -> list[str] | None:
+    """Parse comma-separated LoRA module names.
+
+    ``None`` keeps the model default. An explicit empty string returns an empty
+    list, which lets advanced users intentionally avoid the default target list.
+    """
+    if value is None:
+        return None
+    return [module.strip() for module in value.split(",") if module.strip()]
 
 
 def fasta_to_dataframe(fasta_file: Path) -> pd.DataFrame:
@@ -1111,6 +1149,7 @@ def main() -> None:
 
     print("Building PLANT model...")
     esm_config = EsmConfig.from_pretrained(args.model, use_safetensors=True)
+    lora_target_modules = parse_lora_target_modules(args.lora_target_modules)
     model = semanticESM(
         esm_config,
         args.model,
@@ -1136,7 +1175,7 @@ def main() -> None:
         lora_r=args.lora_r,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
-        lora_target_modules=args.lora_target_modules.split(",") if args.lora_target_modules else None if args.lora_target_modules is None else [],
+        lora_target_modules=lora_target_modules,
         lora_bias=args.lora_bias,
     )
 
@@ -1200,6 +1239,7 @@ def main() -> None:
             "fp16": fp16,
             "embed_scale_factor": embed_scale_factor,
             "model_dir": str(final_model_dir),
+            "plant_model_config": model.get_plant_init_config(),
             "split_summary": split_summary,
         }
     )

@@ -8,6 +8,7 @@ semantic regularization data.
 from __future__ import annotations
 
 import contextlib
+import json
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -30,6 +31,7 @@ OHE_vp = None
 OHE_rp = None
 
 MISSING_LABEL_VALUE = -10.0
+PLANT_INIT_CONFIG_NAME = "plant_model_config.json"
 
 
 def set_encoders(ohe_virus=None, ohe_ref=None, ohe_vp=None, ohe_rp=None) -> None:
@@ -100,8 +102,25 @@ class semanticESM(PreTrainedModel):
                 + _safe_category_count(OHE_rp)
             )
 
+        self.esm_model_name = str(esm_model_name)
+        self.effects_len = int(effects_len) if effects_len is not None else None
+        self.virus_effects_len = (
+            int(virus_effects_len) if virus_effects_len is not None else None
+        )
+        self.latent_dim = int(latent_dim)
+        self.intermediate_dim = int(intermediate_dim)
+        self.intermediate_dim_encoder = int(intermediate_dim_encoder)
+        self.dropout = float(dropout)
+        self.dropout_encoder = float(dropout_encoder)
         self.use_lora = bool(use_lora)
-        self.lora_target_modules = list(lora_target_modules or ([] if lora_target_modules == [] else ["query", "value"]))
+        if lora_target_modules is None:
+            self.lora_target_modules = ["query", "value"]
+        else:
+            self.lora_target_modules = list(lora_target_modules)
+        self.lora_r = int(lora_r)
+        self.lora_alpha = int(lora_alpha)
+        self.lora_dropout = float(lora_dropout)
+        self.lora_bias = str(lora_bias)
 
         base_esm_model = AutoModel.from_pretrained(
             esm_model_name, add_pooling_layer=False
@@ -520,23 +539,93 @@ class semanticESM(PreTrainedModel):
             + local_global_loss_value * self.LG_W
         )
 
+    def get_plant_init_config(self) -> dict:
+        """Return constructor arguments needed to reload this PLANT model."""
+        return {
+            "esm_model_name": self.esm_model_name,
+            "effects_len": self.effects_len,
+            "virus_effects_len": self.virus_effects_len,
+            "embed_scale_factor": self.embed_scale_factor,
+            "latent_dim": self.latent_dim,
+            "intermediate_dim": self.intermediate_dim,
+            "intermediate_dim_encoder": self.intermediate_dim_encoder,
+            "dropout": self.dropout,
+            "dropout_encoder": self.dropout_encoder,
+            "MAIN_W": self.MAIN_W,
+            "CSE_W": self.CSE_W,
+            "CSE_ALPHA": self.CSE_ALPHA,
+            "SEMANTIC_W": self.SEMANTIC_W,
+            "CSE_W_VIRUS_ONLY": self.CSE_W_VIRUS_ONLY,
+            "SEMANTIC_W_VIRUS_ONLY": self.SEMANTIC_W_VIRUS_ONLY,
+            "CART_W": self.CART_W,
+            "LG_W": self.LG_W,
+            "reference_transform_mode": self.reference_transform_mode,
+            "REF_TRANSFORM_W": self.REF_TRANSFORM_W,
+            "REF_SHIFT_W": self.REF_SHIFT_W,
+            "missing_label_value": self.missing_label_value,
+            "use_lora": self.use_lora,
+            "lora_r": self.lora_r,
+            "lora_alpha": self.lora_alpha,
+            "lora_dropout": self.lora_dropout,
+            "lora_target_modules": self.lora_target_modules,
+            "lora_bias": self.lora_bias,
+        }
+
+    def save_pretrained(self, save_directory, *args, **kwargs):  # noqa: D401
+        """Save weights plus PLANT-specific constructor settings."""
+        super().save_pretrained(save_directory, *args, **kwargs)
+        save_path = Path(save_directory)
+        save_path.mkdir(parents=True, exist_ok=True)
+        init_config_path = save_path / PLANT_INIT_CONFIG_NAME
+        init_config_path.write_text(
+            json.dumps(self.get_plant_init_config(), indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
+    @classmethod
+    def _load_plant_init_config(cls, checkpoint_dir: Path) -> dict:
+        init_config_path = checkpoint_dir / PLANT_INIT_CONFIG_NAME
+        if not init_config_path.exists():
+            return {}
+        return json.loads(init_config_path.read_text(encoding="utf-8"))
+
     @classmethod
     def from_pretrained(
         cls,
         pretrained_model_name_or_path,
         *model_args,
         config=None,
+        strict: bool = True,
         **kwargs,
     ):
         """Load a saved PLANT checkpoint.
 
-        This keeps compatibility with the existing local safetensors checkpoint
-        layout while also accepting both single-file and sharded safetensors.
+        If ``plant_model_config.json`` is present in the checkpoint directory,
+        ``semanticESM.from_pretrained(model_dir)`` is sufficient to reconstruct
+        the model architecture and PLANT-specific settings. Explicit keyword
+        arguments override the saved settings. Positional ``model_args`` are
+        kept for backward compatibility with older checkpoints.
         """
+        checkpoint_dir = Path(pretrained_model_name_or_path)
+        saved_init_kwargs = cls._load_plant_init_config(checkpoint_dir)
+
         if config is None:
             config = EsmConfig.from_pretrained(pretrained_model_name_or_path)
-        model = cls(config, *model_args, **kwargs)
-        checkpoint_dir = Path(pretrained_model_name_or_path)
+
+        init_kwargs = {**saved_init_kwargs, **kwargs}
+        if model_args and "esm_model_name" in init_kwargs:
+            # The first historical positional argument is esm_model_name.
+            # Avoid passing it twice when loading with the legacy API.
+            init_kwargs.pop("esm_model_name")
+
+        if not model_args and "esm_model_name" not in init_kwargs:
+            raise ValueError(
+                f"Missing esm_model_name. Either save/load a checkpoint that contains "
+                f"{PLANT_INIT_CONFIG_NAME}, or call from_pretrained(..., "
+                "esm_model_name='<base ESM model>')."
+            )
+
+        model = cls(config, *model_args, **init_kwargs)
 
         safetensor_files = []
         single_file = checkpoint_dir / "model.safetensors"
@@ -555,10 +644,14 @@ class semanticESM(PreTrainedModel):
             part = safe_load(str(f), device="cpu")
             state_dict.update(part)
         missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-        if missing_keys:
-            print("[PLANT] Missing keys:", missing_keys)
-        if unexpected_keys:
-            print("[PLANT] Unexpected keys:", unexpected_keys)
+        if missing_keys or unexpected_keys:
+            message = (
+                "[PLANT] Checkpoint keys do not match the reconstructed model. "
+                f"Missing keys: {missing_keys}; unexpected keys: {unexpected_keys}"
+            )
+            if strict:
+                raise RuntimeError(message)
+            print(message)
         return model
 
     def forward(
