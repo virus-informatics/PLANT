@@ -101,7 +101,7 @@ class semanticESM(PreTrainedModel):
             )
 
         self.use_lora = bool(use_lora)
-        self.lora_target_modules = list(lora_target_modules or ["query", "value"])
+        self.lora_target_modules = list(lora_target_modules or ([] if lora_target_modules == [] else ["query", "value"]))
 
         base_esm_model = AutoModel.from_pretrained(
             esm_model_name, add_pooling_layer=False

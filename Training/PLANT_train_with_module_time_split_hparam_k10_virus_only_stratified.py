@@ -122,7 +122,7 @@ def parse_args() -> argparse.Namespace:
         "--reference_transform_mode",
         dest="reference_transform_mode",
         choices=["none", "full", "diagonal"],
-        default="full",
+        default="none",
         help=(
             "Reference-side coordinate transform. 'full' learns a near-identity "
             "affine transform, 'diagonal' learns axis-wise scaling plus shift, "
@@ -144,6 +144,61 @@ def parse_args() -> argparse.Namespace:
         default=0.05,
         type=float,
         help="Weight for penalizing the data-scale shift of transformed reference points.",
+    )
+    parser.add_argument(
+        "--use-lora",
+        "--use_lora",
+        dest="use_lora",
+        default=True,
+        type=bool,
+        help="Whether to use LoRA adapters for the ESM model.",
+    )
+    parser.add_argument(
+        "--lora-r",
+        "--lora_r",
+        dest="lora_r",
+        default=16,
+        type=int,
+        help="Rank for the LoRA adapters.",
+    )
+    parser.add_argument(
+        "--lora-alpha",
+        "--lora_alpha",
+        dest="lora_alpha",
+        default=32,
+        type=int,
+        help="Alpha for the LoRA adapters.",
+    )
+    parser.add_argument(
+        "--lora-dropout",
+        "--lora_dropout",
+        dest="lora_dropout",
+        default=0.05,
+        type=float,
+        help="Dropout for the LoRA adapters.",
+    )
+    parser.add_argument(
+        "--lora-target-modules",
+        "--lora_target_modules",
+        dest="lora_target_modules",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated list of module names to apply LoRA adapters to. "
+        ),
+    )
+    parser.add_argument(
+        "--lora-bias",
+        "--lora_bias",
+        dest="lora_bias",
+        default="none",
+        choices=["none", "all", "lora_only"],
+        type=str,
+        help=(
+            "Bias option for LoRA adapters. 'none' means no bias, 'all' means "
+            "all biases are trainable, and 'lora_only' means only LoRA biases "
+            "are trainable."
+        )
     )
     parser.add_argument(
         "--time-cutoff-date",
@@ -1077,6 +1132,12 @@ def main() -> None:
         reference_transform_mode=args.reference_transform_mode,
         REF_TRANSFORM_W=args.ref_transform_w,
         REF_SHIFT_W=args.ref_shift_w,
+        use_lora=args.use_lora,
+        lora_r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        lora_target_modules=args.lora_target_modules.split(",") if args.lora_target_modules else None if args.lora_target_modules is None else [],
+        lora_bias=args.lora_bias,
     )
 
     optimizer = build_plant_optimizer(
