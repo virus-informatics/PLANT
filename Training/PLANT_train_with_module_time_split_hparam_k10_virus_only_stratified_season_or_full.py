@@ -799,7 +799,11 @@ def split_dataframe_with_stratified_group_kfold(
     n_splits = max(2, int(round(1 / (1 - train_ratio))))
     skf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
     groups = df["virus"]
-    stratify_labels = df["virus_collection_year"]
+    # stratify_labels = df["virus_collection_year"]
+    stratify_labels = (df["virus_collection_year"].astype(str) + "_"
+                     + df["reference"].astype(str) + "_"
+                     + df["virus_passage"].astype(str) + "_"
+                     + df["reference_passage"].astype(str))
     for train_idx, val_idx in skf.split(df, stratify_labels, groups):
         return df.iloc[train_idx].copy(), df.iloc[val_idx].copy()
     raise RuntimeError("StratifiedGroupKFold did not produce a split.")
