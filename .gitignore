@@ -1,1 +1,6 @@
 .DS_Store
+
+#adaboost
+adaboost/Season_based_split_performance/
+adaboost/logs/
+
