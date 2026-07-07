@@ -296,6 +296,97 @@ def parse_lora_target_modules(value: str | None) -> list[str] | None:
     return [module.strip() for module in value.split(",") if module.strip()]
 
 
+CATEGORY_MAPPING_COLUMNS = (
+    "date",
+    "virus",
+    "reference",
+    "virus_passage",
+    "reference_passage",
+)
+
+
+def build_category_mappings(
+    df: pd.DataFrame,
+    *,
+    category_cols: tuple[str, ...] = CATEGORY_MAPPING_COLUMNS,
+) -> dict[str, object]:
+    """Build string-to-integer mappings used before one-hot encoding.
+
+    The training pipeline first converts metadata strings such as virus_passage
+    to integer ``*_category`` columns with pandas categorical codes.  The
+    OneHotEncoder objects are then fitted on those integer codes, not on the
+    original strings.  This JSON-serializable mapping is therefore required to
+    reproduce systematic-error inference on new data.
+    """
+    mappings: dict[str, object] = {
+        "__metadata__": {
+            "format_version": 1,
+            "description": (
+                "Original metadata value -> integer *_category mappings used "
+                "before fitting the OneHotEncoder systematic-error encoders."
+            ),
+            "unknown_category": -1,
+            "category_columns": list(category_cols),
+        },
+        "__category_to_value__": {},
+    }
+
+    reverse_mappings: dict[str, dict[str, str]] = {}
+    for col in category_cols:
+        category_col = f"{col}_category"
+        if col not in df.columns or category_col not in df.columns:
+            raise ValueError(
+                f"Cannot build category mapping: missing {col!r} or {category_col!r}."
+            )
+
+        mapping_df = (
+            df[[col, category_col]]
+            .drop_duplicates()
+            .sort_values([category_col, col], kind="mergesort")
+            .reset_index(drop=True)
+        )
+
+        value_to_category: dict[str, int] = {}
+        category_to_value: dict[str, str] = {}
+        for _, row in mapping_df.iterrows():
+            value = str(row[col])
+            category = int(row[category_col])
+
+            # Defensive checks: pandas categorical codes should be one-to-one for
+            # a single column.  If this ever fails, the saved mapping would be
+            # unsafe for inference.
+            if value in value_to_category and value_to_category[value] != category:
+                raise ValueError(
+                    f"Inconsistent category mapping for column {col!r}, "
+                    f"value {value!r}: {value_to_category[value]} vs {category}"
+                )
+            category_key = str(category)
+            if category_key in category_to_value and category_to_value[category_key] != value:
+                raise ValueError(
+                    f"Inconsistent reverse category mapping for column {col!r}, "
+                    f"category {category}: {category_to_value[category_key]!r} vs {value!r}"
+                )
+
+            value_to_category[value] = category
+            category_to_value[category_key] = value
+
+        mappings[col] = value_to_category
+        reverse_mappings[col] = category_to_value
+
+    mappings["__category_to_value__"] = reverse_mappings
+    return mappings
+
+
+def save_category_mappings(df: pd.DataFrame, output_path: Path) -> dict[str, object]:
+    """Save metadata string -> integer category mappings for inference."""
+    category_mappings = build_category_mappings(df)
+    output_path.write_text(
+        json.dumps(category_mappings, indent=2, sort_keys=True, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return category_mappings
+
+
 def fasta_to_dataframe(fasta_file: Path) -> pd.DataFrame:
     """Read FASTA without requiring Biopython."""
     ids = []
@@ -1238,6 +1329,10 @@ def main() -> None:
     )
     selected_df_with_season = add_season_order_columns(selected_df, season_col="season")
 
+    category_mappings_path = outputs_path / "category_mappings.json"
+    category_mappings = save_category_mappings(selected_df, category_mappings_path)
+    print(f"Saved category mappings: {category_mappings_path}")
+
     if args.split_mode == "season":
         selected_df_past, selected_df_future = split_past_future_by_cutoff_season(
             selected_df,
@@ -1469,6 +1564,11 @@ def main() -> None:
             "embed_scale_factor": embed_scale_factor,
             "model_dir": str(final_model_dir),
             "plant_model_config": model.get_plant_init_config(),
+            "category_mappings_file": str(category_mappings_path),
+            "category_mapping_columns": list(CATEGORY_MAPPING_COLUMNS),
+            "category_mapping_counts": {
+                col: len(category_mappings[col]) for col in CATEGORY_MAPPING_COLUMNS
+            },
             "split_summary": split_summary,
         }
     )
