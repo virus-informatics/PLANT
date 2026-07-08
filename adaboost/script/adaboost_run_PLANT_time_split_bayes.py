@@ -9,7 +9,7 @@ training script:
 2. In season mode, split rows with season <= cutoff into the past set and rows with
    later seasons into the future set.
 3. Split the past set into train_val/test using StratifiedGroupKFold with
-   groups=virus and stratification labels=virus_collection_year.
+   groups=virus and PLANT-matched stratification labels.
 4. Split train_val into train/validation with the same strategy.
 5. Run BayesSearchCV on the training split, then evaluate validation/test/future.
 
@@ -225,7 +225,135 @@ def season_order_to_label(order: int) -> str:
     return f"SH{(order - 1) // 2:04d}"
 
 
-def add_season_order_columns(df: pd.DataFrame, *, season_col: str = "season") -> pd.DataFrame:
+def resolve_partial_date_interval_for_time_split(date_value) -> tuple[pd.Timestamp, pd.Timestamp]:
+    """Return earliest/latest plausible dates for partial or non-standard dates.
+
+    Examples:
+    - ``1993-aaa`` -> 1993-01-01 to 1993-12-31
+    - ``2024-01-aaa`` -> 2024-01-01 to 2024-01-31
+    - ``2024-01`` -> 2024-01-01 to 2024-01-31
+    - ``2024-01-15`` -> 2024-01-15 to 2024-01-15
+    """
+    if pd.isna(date_value):
+        return pd.NaT, pd.NaT
+
+    raw = str(date_value).strip()
+    if not raw:
+        return pd.NaT, pd.NaT
+
+    # Prefer year-first strings because pandas treats bare years as Jan 1,
+    # whereas for conservative splitting they should represent the whole year.
+    match = re.match(r"^\s*(\d{4})(?:[-/](.*))?\s*$", raw)
+    if match:
+        year = int(match.group(1))
+        remainder = match.group(2)
+
+        if year < 1:
+            return pd.NaT, pd.NaT
+
+        if remainder is None or remainder == "":
+            return (
+                pd.Timestamp(year=year, month=1, day=1),
+                pd.Timestamp(year=year, month=12, day=31),
+            )
+
+        parts = re.split(r"[-/]", remainder)
+        month_token = parts[0] if len(parts) >= 1 else ""
+        if not month_token.isdigit():
+            return (
+                pd.Timestamp(year=year, month=1, day=1),
+                pd.Timestamp(year=year, month=12, day=31),
+            )
+
+        month = int(month_token)
+        if not 1 <= month <= 12:
+            return (
+                pd.Timestamp(year=year, month=1, day=1),
+                pd.Timestamp(year=year, month=12, day=31),
+            )
+
+        last_day = calendar.monthrange(year, month)[1]
+        day_token = parts[1] if len(parts) >= 2 else ""
+        if not day_token.isdigit():
+            return (
+                pd.Timestamp(year=year, month=month, day=1),
+                pd.Timestamp(year=year, month=month, day=last_day),
+            )
+
+        day = int(day_token)
+        if not 1 <= day <= last_day:
+            return (
+                pd.Timestamp(year=year, month=month, day=1),
+                pd.Timestamp(year=year, month=month, day=last_day),
+            )
+
+        exact = pd.Timestamp(year=year, month=month, day=day)
+        return exact, exact
+
+    # Fallback for non-year-first valid dates such as "09/02/2010" or "Nov-2009".
+    try:
+        exact = pd.to_datetime(raw, errors="raise")
+    except Exception:
+        return pd.NaT, pd.NaT
+
+    if pd.isna(exact):
+        return pd.NaT, pd.NaT
+    exact = pd.Timestamp(exact).normalize()
+    return exact, exact
+
+
+def cutoff_season_end_date(cutoff_season: str) -> pd.Timestamp:
+    """Return the inclusive end date of a cutoff season.
+
+    Extractor convention:
+    SHYYYY = YYYY-02-01 to YYYY-08-31
+    NHYYYY = (YYYY-1)-09-01 to YYYY-01-31
+    """
+    normalized, _order = parse_season_label(cutoff_season)
+    hemisphere = normalized[:2]
+    year = int(normalized[2:])
+
+    if hemisphere == "SH":
+        return pd.Timestamp(year=year, month=8, day=31)
+    if hemisphere == "NH":
+        return pd.Timestamp(year=year, month=1, day=31)
+
+    raise ValueError(f"Unknown hemisphere in cutoff season: {cutoff_season!r}")
+
+
+def safe_season_order_to_label(order) -> str | None:
+    """Convert a season order to a label, returning None for missing values."""
+    if pd.isna(order):
+        return None
+    return season_order_to_label(int(order))
+
+
+def sorted_valid_season_labels(values) -> list[str]:
+    """Sort parseable non-missing season labels according to PLANT season order."""
+    labels = []
+    for value in values:
+        if pd.isna(value):
+            continue
+        try:
+            parse_season_label(value)
+        except ValueError:
+            continue
+        labels.append(str(value))
+    return sorted(set(labels), key=lambda s: parse_season_label(s)[1])
+
+
+def add_season_order_columns(
+    df: pd.DataFrame,
+    *,
+    season_col: str = "season",
+    drop_invalid: bool = False,
+) -> pd.DataFrame:
+    """Add normalized season and sortable season-order columns.
+
+    By default, unparseable/missing season labels are kept with NaN season_order.
+    This is important for ``--split-mode full`` and for date-based fallback in
+    ``--split-mode season``.
+    """
     out = df.copy()
     parsed_labels: list[str | None] = []
     parsed_orders: list[float] = []
@@ -240,7 +368,7 @@ def add_season_order_columns(df: pd.DataFrame, *, season_col: str = "season") ->
             invalid_values.append(value)
         else:
             parsed_labels.append(normalized)
-            parsed_orders.append(order)
+            parsed_orders.append(float(order))
 
     out["season_normalized"] = parsed_labels
     out["season_order"] = parsed_orders
@@ -248,13 +376,16 @@ def add_season_order_columns(df: pd.DataFrame, *, season_col: str = "season") ->
     invalid = out["season_order"].isna()
     if invalid.any():
         examples = sorted({str(v) for v in invalid_values})[:10]
+        action = "Dropping" if drop_invalid else "Keeping"
         print(
-            "Dropping rows with unparseable season values for season split: "
+            f"{action} rows with unparseable/missing season values: "
             f"{int(invalid.sum())}. Examples: {examples}"
         )
-        out = out.loc[~invalid].copy()
+        if drop_invalid:
+            out = out.loc[~invalid].copy()
 
-    out["season_order"] = out["season_order"].astype(int)
+    if drop_invalid:
+        out["season_order"] = out["season_order"].astype(int)
     return out
 
 
@@ -263,19 +394,101 @@ def split_past_future_by_cutoff_season(
     *,
     cutoff_season: str,
     season_col: str = "season",
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    cutoff_normalized, cutoff_order = parse_season_label(cutoff_season)
-    out = add_season_order_columns(df, season_col=season_col)
+    date_col: str = "date",
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Split paired data into past/future sets using season labels plus date fallback.
 
-    past = out.loc[out["season_order"] <= cutoff_order].copy()
-    future = out.loc[out["season_order"] > cutoff_order].copy()
+    Rules:
+    1. If ``season_col`` is parseable, use the ordered NH/SH season label.
+    2. If season is missing/unparseable, infer a conservative date interval from
+       ``date_col``. Assign to past only when the latest plausible date is on or
+       before the cutoff season end date. Assign to future only when the earliest
+       plausible date is after the cutoff season end date.
+    3. Rows that remain ambiguous are returned separately and excluded from
+       past/future training/evaluation to avoid leakage.
+    """
+    cutoff_normalized, cutoff_order = parse_season_label(cutoff_season)
+    cutoff_end = cutoff_season_end_date(cutoff_normalized)
+    out = add_season_order_columns(df, season_col=season_col, drop_invalid=False)
+
+    out["season_split_source"] = pd.NA
+    out["date_interval_start"] = pd.NaT
+    out["date_interval_end"] = pd.NaT
+    out["season_split_status"] = pd.NA
+
+    known_season = out["season_order"].notna()
+    past_mask = known_season & (out["season_order"] <= cutoff_order)
+    future_mask = known_season & (out["season_order"] > cutoff_order)
+
+    out.loc[past_mask | future_mask, "season_split_source"] = "season"
+    out.loc[past_mask, "season_split_status"] = "past"
+    out.loc[future_mask, "season_split_status"] = "future"
+
+    unknown_season = ~known_season
+    if unknown_season.any():
+        if date_col not in out.columns:
+            raise ValueError(
+                f"Cannot use date fallback for season split: missing date column {date_col!r}."
+            )
+
+        intervals = out.loc[unknown_season, date_col].apply(resolve_partial_date_interval_for_time_split)
+        starts = intervals.apply(lambda x: x[0])
+        ends = intervals.apply(lambda x: x[1])
+        out.loc[unknown_season, "date_interval_start"] = starts
+        out.loc[unknown_season, "date_interval_end"] = ends
+
+        date_known = starts.notna() & ends.notna()
+        date_past = unknown_season.copy()
+        date_past.loc[:] = False
+        date_future = unknown_season.copy()
+        date_future.loc[:] = False
+
+        date_past.loc[starts.index] = date_known & (ends <= cutoff_end)
+        date_future.loc[starts.index] = date_known & (starts > cutoff_end)
+
+        out.loc[date_past, "season_split_source"] = "date"
+        out.loc[date_past, "season_split_status"] = "past"
+        out.loc[date_future, "season_split_source"] = "date"
+        out.loc[date_future, "season_split_status"] = "future"
+
+        n_unknown = int(unknown_season.sum())
+        n_date_past = int(date_past.sum())
+        n_date_future = int(date_future.sum())
+        n_ambiguous = int(n_unknown - n_date_past - n_date_future)
+        print(
+            "Season split date fallback for rows with missing/unparseable season: "
+            f"unknown={n_unknown}, date_past={n_date_past}, "
+            f"date_future={n_date_future}, ambiguous_or_unparseable={n_ambiguous}, "
+            f"cutoff_end={cutoff_end.date()}"
+        )
+
+    ambiguous = out.loc[out["season_split_status"].isna()].copy()
+    past = out.loc[out["season_split_status"] == "past"].copy()
+    future = out.loc[out["season_split_status"] == "future"].copy()
+
+    if not ambiguous.empty:
+        examples = (
+            ambiguous[[season_col, date_col]]
+            .head(10)
+            .astype("object")
+            .where(pd.notna(ambiguous[[season_col, date_col]].head(10)), None)
+            .to_dict("records")
+        )
+        print(
+            "Excluding rows with ambiguous season/date for season split: "
+            f"{len(ambiguous)}. Examples: {examples}"
+        )
 
     if past.empty:
         raise ValueError(f"No rows assigned to past set with cutoff_season={cutoff_normalized!r}.")
     if future.empty:
         raise ValueError(f"No rows assigned to future set with cutoff_season={cutoff_normalized!r}.")
 
-    return past.reset_index(drop=True), future.reset_index(drop=True)
+    return (
+        past.reset_index(drop=True),
+        future.reset_index(drop=True),
+        ambiguous.reset_index(drop=True),
+    )
 
 
 def clean_paired_dataset(
@@ -335,7 +548,10 @@ def clean_paired_dataset(
         .drop(columns=["_merge"])
     )
 
-    selected = df[required_cols].dropna().copy()
+    # Keep rows with missing/unparseable season so that --split-mode full can use
+    # them and --split-mode season can rescue clearly past/future rows by date.
+    nonnull_required_cols = [col for col in required_cols if col != "season"]
+    selected = df[required_cols].dropna(subset=nonnull_required_cols).copy()
     selected["score"] = selected["score"].astype(float)
     selected["censor"] = selected["censor"].astype(float)
     if score_transform == "clip_0_1":
@@ -362,7 +578,16 @@ def split_dataframe_with_stratified_group_kfold(
     n_splits = max(2, int(round(1 / (1 - train_ratio))))
     skf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
     groups = df["virus"]
-    stratify_labels = df["virus_collection_year"]
+    # Match the PLANT trainer split labels: collection year + assay metadata, grouped by virus.
+    stratify_labels = (
+        df["virus_collection_year"].astype(str)
+        + "_"
+        + df["reference"].astype(str)
+        + "_"
+        + df["virus_passage"].astype(str)
+        + "_"
+        + df["reference_passage"].astype(str)
+    )
     for train_idx, val_idx in skf.split(df, stratify_labels, groups):
         return df.iloc[train_idx].copy(), df.iloc[val_idx].copy()
     raise RuntimeError("StratifiedGroupKFold did not produce a split.")
@@ -752,15 +977,24 @@ def make_inner_cv_splits(
 
     BayesSearchCV normally calls ``cv.split(X, y, groups)``.  For a regression
     target, that would pass the continuous ``score`` values as ``y`` to
-    StratifiedGroupKFold and fail with "Got 'continuous' instead".  Therefore
-    we precompute the split indices using the same labels as PLANT:
-    ``virus_collection_year`` for stratification and ``virus`` for grouping.
+    StratifiedGroupKFold and fail with "Got 'continuous' instead". Therefore
+    we precompute the split indices using the same PLANT-style labels as the
+    outer split, with ``virus`` as the grouping variable.
     """
     if n_splits < 2:
         raise ValueError(f"cv must be at least 2, got {n_splits}")
 
     groups = df["virus"].to_numpy()
-    stratify_labels = df["virus_collection_year"].astype(int).to_numpy()
+    # Match the outer PLANT-style split labels for inner CV as well.
+    stratify_labels = (
+        df["virus_collection_year"].astype(str)
+        + "_"
+        + df["reference"].astype(str)
+        + "_"
+        + df["virus_passage"].astype(str)
+        + "_"
+        + df["reference_passage"].astype(str)
+    ).to_numpy()
 
     unique_groups = pd.Series(groups).nunique()
     if unique_groups < n_splits:
@@ -819,6 +1053,7 @@ def summarize_split(
     selected_df_with_season: pd.DataFrame,
     selected_df_past: pd.DataFrame,
     selected_df_future: pd.DataFrame | None,
+    selected_df_season_ambiguous: pd.DataFrame,
     selected_df_train: pd.DataFrame,
     selected_df_val: pd.DataFrame,
     selected_df_test: pd.DataFrame,
@@ -827,30 +1062,31 @@ def summarize_split(
     split_summary = {
         "split_mode": args.split_mode,
         "cutoff_season": parse_season_label(args.cutoff_season)[0] if args.split_mode == "season" else None,
+        "cutoff_season_end_date": str(cutoff_season_end_date(args.cutoff_season).date()) if args.split_mode == "season" else None,
         "season_col": args.season_col,
         "season_order_convention": "... SH2013 < NH2014 < SH2014 < NH2015 ...",
         "all_after_cleaning": len(selected_df_with_season),
+        "rows_with_missing_or_unparseable_season_after_cleaning": int(
+            selected_df_with_season["season_order"].isna().sum()
+        ) if "season_order" in selected_df_with_season.columns else 0,
+        "season_split_ambiguous_or_unparseable_date": len(selected_df_season_ambiguous),
         "past_total": len(selected_df_past),
-        "future": len(selected_df_future) if has_future else 0,
+        "future": len(selected_df_future) if has_future and selected_df_future is not None else 0,
         "train": len(selected_df_train),
         "validation": len(selected_df_val),
         "test": len(selected_df_test),
-        "past_min_season": season_order_to_label(selected_df_past["season_order"].min()),
-        "past_max_season": season_order_to_label(selected_df_past["season_order"].max()),
-        "past_seasons": sorted(
-            selected_df_past["season_normalized"].unique().tolist(),
-            key=lambda s: parse_season_label(s)[1],
-        ),
+        "past_min_season": safe_season_order_to_label(selected_df_past["season_order"].min()) if "season_order" in selected_df_past.columns else None,
+        "past_max_season": safe_season_order_to_label(selected_df_past["season_order"].max()) if "season_order" in selected_df_past.columns else None,
+        "past_seasons": sorted_valid_season_labels(selected_df_past["season_normalized"].unique().tolist()) if "season_normalized" in selected_df_past.columns else [],
+        "past_split_sources": selected_df_past["season_split_source"].value_counts(dropna=False).astype(int).to_dict() if "season_split_source" in selected_df_past.columns else {},
     }
     if has_future and selected_df_future is not None:
         split_summary.update(
             {
-                "future_min_season": season_order_to_label(selected_df_future["season_order"].min()),
-                "future_max_season": season_order_to_label(selected_df_future["season_order"].max()),
-                "future_seasons": sorted(
-                    selected_df_future["season_normalized"].unique().tolist(),
-                    key=lambda s: parse_season_label(s)[1],
-                ),
+                "future_min_season": safe_season_order_to_label(selected_df_future["season_order"].min()) if "season_order" in selected_df_future.columns else None,
+                "future_max_season": safe_season_order_to_label(selected_df_future["season_order"].max()) if "season_order" in selected_df_future.columns else None,
+                "future_seasons": sorted_valid_season_labels(selected_df_future["season_normalized"].unique().tolist()) if "season_normalized" in selected_df_future.columns else [],
+                "future_split_sources": selected_df_future["season_split_source"].value_counts(dropna=False).astype(int).to_dict() if "season_split_source" in selected_df_future.columns else {},
             }
         )
     else:
@@ -868,7 +1104,7 @@ def determine_cutoff_seasons(args: argparse.Namespace, cleaned_df: pd.DataFrame)
     if args.split_mode == "full":
         return [None]
     if args.all_cutoff_seasons:
-        with_season = add_season_order_columns(cleaned_df, season_col="season")
+        with_season = add_season_order_columns(cleaned_df, season_col="season", drop_invalid=True)
         season_rows = (
             with_season[["season_normalized", "season_order"]]
             .drop_duplicates()
@@ -927,17 +1163,27 @@ def run_one_split(
     outputs_path = storage_path / "Season_based_split_performance" / args.prefix / output_split_label
     outputs_path.mkdir(parents=True, exist_ok=True)
 
-    selected_df_with_season = add_season_order_columns(selected_df, season_col="season")
+    selected_df_with_season = add_season_order_columns(
+        selected_df,
+        season_col="season",
+        drop_invalid=False,
+    )
     if args.split_mode == "season":
-        selected_df_past, selected_df_future = split_past_future_by_cutoff_season(
+        selected_df_past, selected_df_future, selected_df_season_ambiguous = split_past_future_by_cutoff_season(
             selected_df,
             cutoff_season=args.cutoff_season,
             season_col="season",
+            date_col="date",
         )
+        if not selected_df_season_ambiguous.empty:
+            ambiguous_path = outputs_path / "season_split_ambiguous_rows.csv"
+            selected_df_season_ambiguous.to_csv(ambiguous_path, index=False)
+            print(f"Saved ambiguous season/date rows excluded from season split: {ambiguous_path}")
         has_future = True
     else:
         selected_df_past = selected_df_with_season.reset_index(drop=True)
         selected_df_future = None
+        selected_df_season_ambiguous = pd.DataFrame()
         has_future = False
 
     selected_df_train_val, selected_df_test = split_dataframe_with_stratified_group_kfold(
@@ -964,6 +1210,7 @@ def run_one_split(
         selected_df_with_season=selected_df_with_season,
         selected_df_past=selected_df_past,
         selected_df_future=selected_df_future,
+        selected_df_season_ambiguous=selected_df_season_ambiguous,
         selected_df_train=selected_df_train,
         selected_df_val=selected_df_val,
         selected_df_test=selected_df_test,
