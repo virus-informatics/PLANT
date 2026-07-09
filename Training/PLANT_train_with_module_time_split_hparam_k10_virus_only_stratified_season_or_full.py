@@ -123,9 +123,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-samples-per-combination", "--num_samples_per_combination", dest="num_samples_per_combination", default=1, type=int)
     parser.add_argument("--CSE-w", "--CSE_w", dest="CSE_w", default=0.0, type=float)
     parser.add_argument("--CSE-w-virus-only", "--CSE_w_virus_only", dest="CSE_w_virus_only", default=0.0, type=float)
-    parser.add_argument("--semantic-w", "--semantic_w", dest="semantic_w", default=0.2, type=float)
-    parser.add_argument("--semantic-w-virus-only", "--semantic_w_virus_only", dest="semantic_w_virus_only", default=0.2, type=float)
-    parser.add_argument("--cart-w", "--cart_w", dest="cart_w", default=0.05, type=float)
+    parser.add_argument("--semantic-w", "--semantic_w", dest="semantic_w", default=0.1, type=float)
+    parser.add_argument("--semantic-w-virus-only", "--semantic_w_virus_only", dest="semantic_w_virus_only", default=0.1, type=float)
+    parser.add_argument("--cart-w", "--cart_w", dest="cart_w", default=0.1, type=float)
     parser.add_argument("--dropout-regressor", "--dropout_regressor", dest="dropout_regressor", default=0.05, type=float)
     parser.add_argument("--reg-intermediate-dim", "--reg_intermediate_dim", dest="reg_intermediate_dim", default=256, type=int)
     parser.add_argument("--CSE-alpha", "--CSE_alpha", dest="CSE_alpha", default=0.0, type=float)
@@ -170,9 +170,9 @@ def parse_args() -> argparse.Namespace:
         type=str2bool,
         help=(
             "Freeze the ESM model completely (no LoRA, no full fine-tuning). "
+            "Must be used together with --no-use-lora explicitly "
+            "(e.g., --freeze-esm --no-use-lora). "
             "Accepts optional true/false for backward-compatible CLI usage."
-            "Note: --no-use-lora must be specified explicitly when using this flag, "
-            "otherwise an error will be raised."
         ),
     )
     freeze_esm_group.add_argument(
@@ -227,7 +227,7 @@ def parse_args() -> argparse.Namespace:
         "--lora-dropout",
         "--lora_dropout",
         dest="lora_dropout",
-        default=0.05,
+        default=0.1,
         type=float,
         help="Dropout for the LoRA adapters.",
     )
@@ -320,15 +320,22 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def parse_lora_target_modules(value: str | None) -> list[str] | None:
+def parse_lora_target_modules(value: str | None) -> list[str]:
     """Parse comma-separated LoRA module names.
 
-    ``None`` keeps the model default. An explicit empty string returns an empty
-    list, which lets advanced users intentionally avoid the default target list.
+    If None is given, defaults to ["query", "key", "value"] as the best-known setting.
+    An empty string is not allowed and will raise a ValueError.
     """
     if value is None:
-        return None
-    return [module.strip() for module in value.split(",") if module.strip()]
+        return ["query", "key", "value"]
+    modules = [module.strip() for module in value.split(",") if module.strip()]
+    if not modules:
+        raise ValueError(
+            "--lora-target-modules cannot be empty. "
+            "Specify at least one module name (e.g., 'query,key,value'), "
+            "or omit the argument to use the default ['query', 'key', 'value']."
+        )
+    return modules
 
 
 CATEGORY_MAPPING_COLUMNS = (
@@ -1011,9 +1018,7 @@ def split_dataframe_with_stratified_group_kfold(
     n_splits = max(2, int(round(1 / (1 - train_ratio))))
     skf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
     groups = df["virus"]
-    # stratify_labels = df["virus_collection_year"]
     stratify_labels = (df["virus_collection_year"].astype(str) + "_"
-                     + df["reference"].astype(str) + "_"
                      + df["virus_passage"].astype(str) + "_"
                      + df["reference_passage"].astype(str))
     for train_idx, val_idx in skf.split(df, stratify_labels, groups):

@@ -75,20 +75,20 @@ class semanticESM(PreTrainedModel):
         MAIN_W: float = 1.0,
         CSE_W: float = 0.0,
         CSE_ALPHA: float = 0.0,
-        SEMANTIC_W: float = 0.2,
+        SEMANTIC_W: float = 0.1,
         CSE_W_VIRUS_ONLY: float = 0.0,
-        SEMANTIC_W_VIRUS_ONLY: float = 0.2,
-        CART_W: float = 0.05,
+        SEMANTIC_W_VIRUS_ONLY: float = 0.1,
+        CART_W: float = 0.1,
         LG_W: float = 0.0,
-        reference_transform_mode: str = "full",
+        reference_transform_mode: str = "none",
         REF_TRANSFORM_W: float = 0.05,
         REF_SHIFT_W: float = 0.05,
         missing_label_value: float = MISSING_LABEL_VALUE,
         freeze_esm: bool = False,
-        use_lora: bool = True, #False,
+        use_lora: bool = True,
         lora_r: int = 16,
         lora_alpha: int = 32,
-        lora_dropout: float = 0.05,
+        lora_dropout: float = 0.1,
         lora_target_modules: Optional[Sequence[str]] = None,
         lora_bias: str = "none",
     ) -> None:
@@ -118,7 +118,7 @@ class semanticESM(PreTrainedModel):
         if self.freeze_esm and self.use_lora:
             raise ValueError("freeze_esm=True and use_lora=True cannot be set simultaneously.")
         if lora_target_modules is None:
-            self.lora_target_modules = ["query", "value"]
+            self.lora_target_modules = ["query", "key", "value"]
         else:
             self.lora_target_modules = list(lora_target_modules)
         self.lora_r = int(lora_r)
