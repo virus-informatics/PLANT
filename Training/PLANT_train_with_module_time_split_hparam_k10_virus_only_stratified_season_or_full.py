@@ -160,6 +160,29 @@ def parse_args() -> argparse.Namespace:
         type=float,
         help="Weight for penalizing the data-scale shift of transformed reference points.",
     )
+    freeze_esm_group = parser.add_mutually_exclusive_group()
+    freeze_esm_group.add_argument(
+        "--freeze-esm",
+        "--freeze_esm",
+        dest="freeze_esm",
+        nargs="?",
+        const=True,
+        type=str2bool,
+        help=(
+            "Freeze the ESM model completely (no LoRA, no full fine-tuning). "
+            "Accepts optional true/false for backward-compatible CLI usage."
+            "Note: --no-use-lora must be specified explicitly when using this flag, "
+            "otherwise an error will be raised."
+        ),
+    )
+    freeze_esm_group.add_argument(
+        "--no-freeze-esm",
+        "--no_freeze_esm",
+        dest="freeze_esm",
+        action="store_false",
+        help="Do not freeze the ESM model (default).",
+    )
+    parser.set_defaults(freeze_esm=False)
     lora_group = parser.add_mutually_exclusive_group()
     lora_group.add_argument(
         "--use-lora",
@@ -178,7 +201,10 @@ def parse_args() -> argparse.Namespace:
         "--no_use_lora",
         dest="use_lora",
         action="store_false",
-        help="Disable LoRA adapters and use full fine-tuning mode.",
+        help=(
+            "Disable LoRA adapters. Without --freeze-esm, this enables full fine-tuning "
+            "of the ESM model. With --freeze-esm, the ESM model is completely frozen."
+        ),
     )
     parser.set_defaults(use_lora=True)
     parser.add_argument(
@@ -274,7 +300,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--no-fp16", action="store_true")
-    return parser.parse_args()
+
+    args = parser.parse_args()
+
+    if args.freeze_esm and args.use_lora:
+        parser.error(
+            "--freeze-esm and --use-lora cannot be set simultaneously. "
+            "Please specify --no-use-lora explicitly when using --freeze-esm."
+        )
+
+    return args
 
 
 def set_seed(seed: int) -> None:
@@ -1691,6 +1726,7 @@ def main() -> None:
         reference_transform_mode=args.reference_transform_mode,
         REF_TRANSFORM_W=args.ref_transform_w,
         REF_SHIFT_W=args.ref_shift_w,
+        freeze_esm=args.freeze_esm,
         use_lora=args.use_lora,
         lora_r=args.lora_r,
         lora_alpha=args.lora_alpha,

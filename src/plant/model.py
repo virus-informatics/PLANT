@@ -84,6 +84,7 @@ class semanticESM(PreTrainedModel):
         REF_TRANSFORM_W: float = 0.05,
         REF_SHIFT_W: float = 0.05,
         missing_label_value: float = MISSING_LABEL_VALUE,
+        freeze_esm: bool = False,
         use_lora: bool = True, #False,
         lora_r: int = 16,
         lora_alpha: int = 32,
@@ -112,7 +113,10 @@ class semanticESM(PreTrainedModel):
         self.intermediate_dim_encoder = int(intermediate_dim_encoder)
         self.dropout = float(dropout)
         self.dropout_encoder = float(dropout_encoder)
+        self.freeze_esm = bool(freeze_esm)
         self.use_lora = bool(use_lora)
+        if self.freeze_esm and self.use_lora:
+            raise ValueError("freeze_esm=True and use_lora=True cannot be set simultaneously.")
         if lora_target_modules is None:
             self.lora_target_modules = ["query", "value"]
         else:
@@ -127,7 +131,12 @@ class semanticESM(PreTrainedModel):
         )
         self.embedding_dim = base_esm_model.config.hidden_size
 
-        if self.use_lora:
+        if self.freeze_esm:
+            for param in base_esm_model.parameters():
+                param.requires_grad = False
+            self.esm_model = base_esm_model
+            self.esm_model_original = None
+        elif self.use_lora:
             if LoraConfig is None or get_peft_model is None:
                 raise ImportError(
                     "use_lora=True requires the `peft` package. Install it with `pip install peft`."
@@ -294,10 +303,15 @@ class semanticESM(PreTrainedModel):
     ) -> torch.Tensor:
         """Extract original frozen ESM embeddings.
 
-        In full-finetuning mode this uses the separate frozen ESM copy.  In LoRA
-        mode this reuses the single ESM backbone with adapters temporarily
+        In freeze ESM mode (no LoRA, no full-finetuning) this uses the frozen ESM.
+        In full-finetuning mode this uses the separate frozen ESM copy.
+        In LoRA mode this reuses the single ESM backbone with adapters temporarily
         disabled, avoiding a second copy of ESM-2 in memory.
         """
+        if self.freeze_esm:
+            return self.extract_pooled_embeddings(
+                self.esm_model, input_ids, attention_mask
+            )
         if self.use_lora:
             with self._adapter_disabled_context():
                 return self.extract_pooled_embeddings(
@@ -563,6 +577,7 @@ class semanticESM(PreTrainedModel):
             "REF_TRANSFORM_W": self.REF_TRANSFORM_W,
             "REF_SHIFT_W": self.REF_SHIFT_W,
             "missing_label_value": self.missing_label_value,
+            "freeze_esm": self.freeze_esm,
             "use_lora": self.use_lora,
             "lora_r": self.lora_r,
             "lora_alpha": self.lora_alpha,
