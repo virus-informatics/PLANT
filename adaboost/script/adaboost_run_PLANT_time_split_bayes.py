@@ -582,8 +582,6 @@ def split_dataframe_with_stratified_group_kfold(
     stratify_labels = (
         df["virus_collection_year"].astype(str)
         + "_"
-        + df["reference"].astype(str)
-        + "_"
         + df["virus_passage"].astype(str)
         + "_"
         + df["reference_passage"].astype(str)
@@ -988,8 +986,6 @@ def make_inner_cv_splits(
     # Match the outer PLANT-style split labels for inner CV as well.
     stratify_labels = (
         df["virus_collection_year"].astype(str)
-        + "_"
-        + df["reference"].astype(str)
         + "_"
         + df["virus_passage"].astype(str)
         + "_"
