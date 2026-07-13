@@ -160,7 +160,7 @@ def parse_args() -> argparse.Namespace:
         default="train",
         help=(
             "Data used for BayesSearchCV. Default 'train' mirrors PLANT's explicit train split; "
-            "'train_val' uses the full 80%% past split for baseline model selection."
+            "'train_val' uses the full 90%% past split for baseline model selection."
         ),
     )
     parser.add_argument(
@@ -1183,7 +1183,7 @@ def run_one_split(
         has_future = False
 
     selected_df_train_val, selected_df_test = split_dataframe_with_stratified_group_kfold(
-        selected_df_past, train_ratio=0.8, seed=args.random_seed
+        selected_df_past, train_ratio=0.9, seed=args.random_seed
     )
     selected_df_test = selected_df_test.copy()
     selected_df_test["weight"] = 1.0
