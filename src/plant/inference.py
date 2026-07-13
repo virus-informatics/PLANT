@@ -38,7 +38,7 @@ from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, EsmConfig
 
 from .data import TextDataset, tokenize_sequences
-from .model import semanticESM, set_encoders
+from .model import semanticESM
 
 
 CATEGORY_MAPPING_COLUMNS: tuple[str, ...] = (
@@ -254,7 +254,11 @@ def load_systematic_error_encoders(
     *,
     required: bool = False,
 ) -> dict[str, Any]:
-    """Load saved OneHotEncoder objects and register them in ``plant.model``."""
+    """Load saved OneHotEncoder objects.
+
+    Encoders are attached to the reconstructed model instance by
+    :func:`load_plant_inference`; no module-global state is modified.
+    """
     artifacts_dir = Path(artifacts_dir)
     encoders: dict[str, Any] = {}
     missing: list[str] = []
@@ -273,12 +277,6 @@ def load_systematic_error_encoders(
             f"{artifacts_dir}: {missing}"
         )
 
-    set_encoders(
-        encoders.get("virus"),
-        encoders.get("reference"),
-        encoders.get("virus_passage"),
-        encoders.get("reference_passage"),
-    )
     return encoders
 
 
@@ -392,6 +390,12 @@ def load_plant_inference(
 
     esm_config = EsmConfig.from_pretrained(model_dir)
     model = semanticESM(esm_config, **plant_model_config)
+    model.set_encoders(
+        encoders.get("virus"),
+        encoders.get("reference"),
+        encoders.get("virus_passage"),
+        encoders.get("reference_passage"),
+    )
 
     raw_state_dict = _load_safetensors_state_dict(model_dir)
     state_dict, n_renamed = _remap_layernorm_gamma_beta(
@@ -412,9 +416,14 @@ def load_plant_inference(
     model.to(device_obj)
     model.eval()
 
-    max_length = int(training_config.get("max_length", tokenizer.model_max_length))
-    if max_length is None or max_length <= 0 or max_length > 100000:
-        max_length = int(getattr(model.config, "max_position_embeddings", 329) or 329)
+    # New training runs store the tokenizer length separately from the raw amino-acid
+    # length. For older checkpoints, preserve the historical max_length behavior.
+    configured_max_length = training_config.get(
+        "token_max_length", training_config.get("max_length", tokenizer.model_max_length)
+    )
+    max_length = int(configured_max_length)
+    if max_length <= 0 or max_length > 100000:
+        max_length = int(getattr(model.config, "max_position_embeddings", 331) or 331)
 
     return PlantInferenceArtifacts(
         model=model,
@@ -742,7 +751,10 @@ def predict_pairwise_distances(
                 for key, value in batch.items()
                 if torch.is_tensor(value)
             }
-            outputs = model(**batch)
+            outputs = model(
+                **batch,
+                apply_systematic_error=use_systematic_error,
+            )
             if outputs.logits is None:
                 raise RuntimeError("Model returned logits=None during pairwise prediction.")
             logits_parts.append(outputs.logits[:, :2].float().cpu().numpy())

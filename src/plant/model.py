@@ -25,22 +25,8 @@ except ImportError:  # pragma: no cover - PEFT is optional unless use_lora=True.
     get_peft_model = None
 
 
-OHE_virus = None
-OHE_ref = None
-OHE_vp = None
-OHE_rp = None
-
 MISSING_LABEL_VALUE = -10.0
 PLANT_INIT_CONFIG_NAME = "plant_model_config.json"
-
-
-def set_encoders(ohe_virus=None, ohe_ref=None, ohe_vp=None, ohe_rp=None) -> None:
-    """Register fitted OneHotEncoder objects used by systematic-error terms."""
-    global OHE_virus, OHE_ref, OHE_vp, OHE_rp
-    OHE_virus = ohe_virus
-    OHE_ref = ohe_ref
-    OHE_vp = ohe_vp
-    OHE_rp = ohe_rp
 
 
 def _safe_category_count(encoder) -> int:
@@ -94,14 +80,14 @@ class semanticESM(PreTrainedModel):
     ) -> None:
         super().__init__(config)
 
+        # Encoder objects are attached to each model instance with set_encoders().
+        # The layer dimensions must therefore be supplied explicitly when systematic
+        # error terms are used. Saved checkpoints contain these values in
+        # plant_model_config.json.
         if virus_effects_len is None:
-            virus_effects_len = _safe_category_count(OHE_virus)
+            virus_effects_len = 0
         if effects_len is None:
-            effects_len = (
-                _safe_category_count(OHE_ref)
-                + _safe_category_count(OHE_vp)
-                + _safe_category_count(OHE_rp)
-            )
+            effects_len = 0
 
         self.esm_model_name = str(esm_model_name)
         self.effects_len = int(effects_len) if effects_len is not None else None
@@ -134,6 +120,10 @@ class semanticESM(PreTrainedModel):
         if self.freeze_esm:
             for param in base_esm_model.parameters():
                 param.requires_grad = False
+            # A newly constructed nn.Module starts in training mode. Freeze mode
+            # should be deterministic even before the outer PLANT model receives
+            # its first explicit train()/eval() call.
+            base_esm_model.eval()
             self.esm_model = base_esm_model
             self.esm_model_original = None
         elif self.use_lora:
@@ -223,6 +213,57 @@ class semanticESM(PreTrainedModel):
         self.embed_scale_factor = float(embed_scale_factor)
         self.missing_label_value = float(missing_label_value)
 
+        # OneHotEncoder objects are runtime artifacts and are intentionally kept on
+        # the model instance rather than in module-global state. This allows multiple
+        # PLANT models with different category spaces to coexist safely in one process.
+        self.ohe_virus = None
+        self.ohe_ref = None
+        self.ohe_vp = None
+        self.ohe_rp = None
+
+    def set_encoders(self, ohe_virus=None, ohe_ref=None, ohe_vp=None, ohe_rp=None) -> None:
+        """Attach fitted systematic-error encoders to this model instance.
+
+        The encoder dimensions are checked against the trained linear layers when
+        an encoder is provided. Missing encoders are allowed for coordinate-only
+        inference, where ``apply_systematic_error=False`` is used.
+        """
+        if ohe_virus is not None and self.virus_effects is not None:
+            actual = _safe_category_count(ohe_virus)
+            expected = self.virus_effects.in_features
+            if actual != expected:
+                raise ValueError(
+                    "Virus encoder category count does not match the model: "
+                    f"encoder={actual}, model={expected}."
+                )
+
+        provided_effect_encoders = [ohe_ref, ohe_vp, ohe_rp]
+        n_provided_effect_encoders = sum(
+            encoder is not None for encoder in provided_effect_encoders
+        )
+        if n_provided_effect_encoders not in {0, len(provided_effect_encoders)}:
+            raise ValueError(
+                "Reference, virus-passage, and reference-passage encoders must "
+                "either all be provided or all be omitted."
+            )
+
+        if (
+            self.systematic_error_effects is not None
+            and n_provided_effect_encoders == len(provided_effect_encoders)
+        ):
+            actual = sum(_safe_category_count(encoder) for encoder in provided_effect_encoders)
+            expected = self.systematic_error_effects[0].in_features
+            if actual != expected:
+                raise ValueError(
+                    "Reference/passage encoder category count does not match the model: "
+                    f"encoders={actual}, model={expected}."
+                )
+
+        self.ohe_virus = ohe_virus
+        self.ohe_ref = ohe_ref
+        self.ohe_vp = ohe_vp
+        self.ohe_rp = ohe_rp
+
     @property
     def device(self) -> torch.device:
         return next(self.parameters()).device
@@ -235,8 +276,12 @@ class semanticESM(PreTrainedModel):
         return esm_model
 
     def train(self, mode: bool = True):  # noqa: D401
-        """Set training mode while keeping the original frozen ESM path in eval mode."""
+        """Set training mode while keeping frozen ESM paths in evaluation mode."""
         super().train(mode)
+        if self.freeze_esm:
+            # requires_grad=False does not disable dropout. Keep the frozen backbone
+            # deterministic throughout regressor-only training.
+            self.esm_model.eval()
         if self.esm_model_original is not None:
             self.esm_model_original.eval()
         return self
@@ -331,7 +376,7 @@ class semanticESM(PreTrainedModel):
         embed_scale_factor: float,
     ) -> torch.Tensor:
         if latents.size(0) < 2:
-            return torch.tensor(0.0, device=latents.device)
+            return latents.sum() * 0.0
         pairwise_distances = torch.cdist(latents, latents, p=2)
         upper_triangle_indices = torch.triu_indices(
             pairwise_distances.size(0),
@@ -355,7 +400,7 @@ class semanticESM(PreTrainedModel):
         alpha: float = 1.0,
     ) -> torch.Tensor:
         if embeddings1.size(0) < 2:
-            return torch.tensor(0.0, device=embeddings1.device)
+            return embeddings1.sum() * 0.0
         distance_matrix = torch.cdist(embeddings1, embeddings2, p=2)
         positive_loss = torch.mean(torch.diag(distance_matrix))
 
@@ -373,7 +418,7 @@ class semanticESM(PreTrainedModel):
             negative_distances = distance_matrix.reshape(-1)
 
         if negative_distances.numel() == 0:
-            negative_loss = torch.tensor(0.0, device=embeddings1.device)
+            negative_loss = embeddings1.sum() * 0.0
         else:
             margin_loss = torch.clamp(margin - negative_distances, min=0)
             weight = torch.exp(-alpha * negative_distances)
@@ -387,7 +432,7 @@ class semanticESM(PreTrainedModel):
         margin_global: float = 0.125,
     ) -> torch.Tensor:
         if latents.size(0) < 2:
-            return torch.tensor(0.0, device=latents.device)
+            return latents.sum() * 0.0
         dists = torch.cdist(latents, latents, p=2)
         n = latents.size(0)
         eye_mask = torch.eye(n, device=dists.device).bool()
@@ -398,7 +443,7 @@ class semanticESM(PreTrainedModel):
             knn_dists, _ = torch.topk(dists_no_self, k=k_safe, largest=False, dim=1)
             local_loss = torch.mean(knn_dists)
         else:
-            local_loss = torch.tensor(0.0, device=latents.device)
+            local_loss = latents.sum() * 0.0
 
         margin_mask = dists_no_self < margin_global
         repel_loss = torch.clamp(margin_global - dists_no_self, min=0.0)
@@ -532,6 +577,11 @@ class semanticESM(PreTrainedModel):
         virus_regressor_out2: torch.Tensor,
         virus_embedding_original: torch.Tensor,
     ) -> torch.Tensor:
+        if virus_regressor_out.size(0) < 2:
+            # A singleton virus-only batch has no pairwise semantic relation. Return
+            # a differentiable zero so Trainer.backward() remains valid.
+            return virus_regressor_out.sum() * 0.0
+
         contrastive_loss_value = self.contrastive_loss_semantic(
             virus_regressor_out, virus_regressor_out2, alpha=self.CSE_ALPHA
         )
@@ -667,6 +717,10 @@ class semanticESM(PreTrainedModel):
             if strict:
                 raise RuntimeError(message)
             print(message)
+
+        # Match Hugging Face from_pretrained() semantics: returned models are in
+        # evaluation mode unless the caller explicitly enables training.
+        model.eval()
         return model
 
     def forward(
@@ -683,6 +737,7 @@ class semanticESM(PreTrainedModel):
         virus_passage: Optional[torch.Tensor] = None,
         reference_passage: Optional[torch.Tensor] = None,
         weight: Optional[torch.Tensor] = None,
+        apply_systematic_error: bool = True,
         **kwargs,
     ) -> ModelOutput:
         del dates, kwargs  # currently unused, kept for API compatibility
@@ -739,7 +794,7 @@ class semanticESM(PreTrainedModel):
                 virus_embedding_original[no_label_mask],
             )
         else:
-            loss_no_labels = torch.tensor(0.0, device=device)
+            loss_no_labels = virus_regressor_out.sum() * 0.0
 
         # Supervised antigenic-distance loss for paired examples.
         if has_labels_mask.any():
@@ -777,32 +832,41 @@ class semanticESM(PreTrainedModel):
             systematic_error1 = torch.zeros_like(distance)
             systematic_error2 = torch.zeros_like(distance)
 
-            if self.virus_effects is not None:
-                virus_encoding = self.encode_one_hot(
-                    OHE_virus,
-                    virus.to(device)[has_labels_mask] if virus is not None else None,
-                )
-                if virus_encoding is not None:
-                    systematic_error1 = self.virus_effects(virus_encoding)
-                    systematic_error = systematic_error + systematic_error1
-
-            if self.systematic_error_effects is not None:
-                parts = []
-                if reference is not None:
-                    x = self.encode_one_hot(OHE_ref, reference.to(device)[has_labels_mask])
-                    if x is not None:
-                        parts.append(x)
-                if virus_passage is not None:
-                    x = self.encode_one_hot(OHE_vp, virus_passage.to(device)[has_labels_mask])
-                    if x is not None:
-                        parts.append(x)
-                if reference_passage is not None:
-                    x = self.encode_one_hot(
-                        OHE_rp, reference_passage.to(device)[has_labels_mask]
+            if apply_systematic_error:
+                if self.virus_effects is not None:
+                    if self.ohe_virus is None or virus is None:
+                        raise RuntimeError(
+                            "Systematic-error prediction requires both the virus "
+                            "encoder and virus category tensor. Attach encoders with "
+                            "model.set_encoders(...) or set apply_systematic_error=False."
+                        )
+                    virus_encoding = self.encode_one_hot(
+                        self.ohe_virus,
+                        virus.to(device)[has_labels_mask],
                     )
-                    if x is not None:
-                        parts.append(x)
-                if parts:
+                    if virus_encoding is not None:
+                        systematic_error1 = self.virus_effects(virus_encoding)
+                        systematic_error = systematic_error + systematic_error1
+
+                if self.systematic_error_effects is not None:
+                    effect_encoders = (self.ohe_ref, self.ohe_vp, self.ohe_rp)
+                    effect_tensors = (reference, virus_passage, reference_passage)
+                    if any(encoder is None for encoder in effect_encoders) or any(
+                        tensor is None for tensor in effect_tensors
+                    ):
+                        raise RuntimeError(
+                            "Systematic-error prediction requires reference, "
+                            "virus-passage, and reference-passage encoders and category "
+                            "tensors. Attach encoders with model.set_encoders(...) or "
+                            "set apply_systematic_error=False."
+                        )
+
+                    parts = [
+                        self.encode_one_hot(
+                            encoder, tensor.to(device)[has_labels_mask]
+                        )
+                        for encoder, tensor in zip(effect_encoders, effect_tensors)
+                    ]
                     combined_encoding = torch.cat(parts, dim=-1)
                     systematic_error2 = self.systematic_error_effects(combined_encoding)
                     systematic_error = systematic_error + systematic_error2
@@ -847,7 +911,7 @@ class semanticESM(PreTrainedModel):
             )
             logits[has_labels_mask] = logits_labeled
         else:
-            combined_loss = torch.tensor(0.0, device=device)
+            combined_loss = virus_regressor_out.sum() * 0.0
             logits = None
 
         total_loss = combined_loss + loss_no_labels

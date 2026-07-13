@@ -15,7 +15,7 @@ from .inference import (
     prepare_pairwise_metadata_categories,
     resolve_model_and_artifacts_dirs,
 )
-from .model import semanticESM, set_encoders
+from .model import semanticESM
 from .training import (
     BalancedCombinationTrainer,
     build_plant_optimizer,
@@ -28,7 +28,6 @@ __all__ = [
     "TextDataset",
     "tokenize_sequences",
     "semanticESM",
-    "set_encoders",
     "CATEGORY_MAPPING_COLUMNS",
     "ENCODER_FILENAMES",
     "SYSTEMATIC_ERROR_COLUMNS",

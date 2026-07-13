@@ -135,6 +135,47 @@ class BalancedCombinationSampler(Sampler[int]):
         return len(dataset)
 
 
+class NoSingletonBatchSampler(BatchSampler):
+    """Batch sampler that drops only a final singleton batch.
+
+    A batch containing exactly one virus-only example has no pairwise semantic
+    relation. Although the model returns a differentiable zero for safety, such a
+    batch would still consume an optimizer/scheduler step. When ``drop_last=False``,
+    keep ordinary partial batches but omit a final batch only when it has one item.
+    This avoids both a no-op step and a batch larger than the configured batch size.
+    """
+
+    def __iter__(self):
+        pending_batch = None
+        for batch in super().__iter__():
+            if pending_batch is not None:
+                yield pending_batch
+            pending_batch = list(batch)
+
+        if pending_batch is None:
+            return
+
+        if (
+            not self.drop_last
+            and self.batch_size > 1
+            and len(pending_batch) == 1
+            and len(self.sampler) > 1
+        ):
+            return
+
+        yield pending_batch
+
+    def __len__(self) -> int:
+        base_length = super().__len__()
+        if self.drop_last or self.batch_size <= 1:
+            return base_length
+
+        sampler_length = len(self.sampler)
+        if sampler_length > 1 and sampler_length % self.batch_size == 1:
+            return base_length - 1
+        return base_length
+
+
 class BalancedCombinationTrainer(Trainer):
     """Trainer that samples at most N examples per experimental combination.
 
@@ -163,7 +204,7 @@ class BalancedCombinationTrainer(Trainer):
             seed=self.random_seed,
             shuffle=True,
         )
-        batch_sampler = BatchSampler(
+        batch_sampler = NoSingletonBatchSampler(
             sampler,
             self.args.train_batch_size,
             drop_last=self.args.dataloader_drop_last,

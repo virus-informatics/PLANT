@@ -45,9 +45,7 @@ from plant import (  # noqa: E402
     build_plant_optimizer,
     compute_embedding_distances,
     embed_sequences,
-    estimate_embed_scale_factor,
     semanticESM,
-    set_encoders,
     tokenize_sequences,
 )
 
@@ -107,7 +105,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--checkpoint", default=None, help="Checkpoint to resume from.")
     parser.add_argument("--model", default="facebook/esm2_t36_3B_UR50D")
-    parser.add_argument("--max-length", default=329, type=int)
+    parser.add_argument(
+        "--max-length",
+        default=329,
+        type=int,
+        help=(
+            "Expected raw amino-acid sequence length. The tokenizer length is "
+            "set internally to max_length + 2 for ESM <cls>/<eos> tokens."
+        ),
+    )
     parser.add_argument("--batch-size", "--batch_size", dest="batch_size", default=16, type=int)
     parser.add_argument("--eval-batch-size", "--eval_batch_size", dest="eval_batch_size", default=32, type=int)
     parser.add_argument("--embedding-batch-size", "--embedding_batch_size", dest="embedding_batch_size", default=128, type=int)
@@ -505,7 +511,18 @@ def resolve_partial_date_interval_for_time_split(date_value) -> tuple[pd.Timesta
     if pd.isna(date_value):
         return pd.NaT, pd.NaT
 
-    raw = str(date_value).strip()
+    # CSV columns containing bare years plus missing values may be inferred as
+    # floating point, turning 1996 into 1996.0. Recover integer-valued numeric
+    # years before string parsing so they are treated as full-year intervals.
+    if isinstance(date_value, (int, np.integer)):
+        raw = str(int(date_value))
+    elif isinstance(date_value, (float, np.floating)):
+        if not np.isfinite(date_value):
+            return pd.NaT, pd.NaT
+        raw = str(int(date_value)) if float(date_value).is_integer() else str(date_value)
+    else:
+        raw = str(date_value).strip()
+
     if not raw:
         return pd.NaT, pd.NaT
 
@@ -822,6 +839,65 @@ def load_sequence_pool(fasta_path: Path, metadata_path: Path | None) -> pd.DataF
             df["HA_type"] = df["serotype"].astype(str).str.slice(0, 2)
     df = df[~df["seq"].str.contains("X", regex=False, na=False)].copy()
     return df.reset_index(drop=True)
+
+
+def filter_sequence_pool_by_cutoff_date(
+    sequence_pool_df: pd.DataFrame,
+    *,
+    cutoff_season: str,
+    date_col: str = "date",
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Exclude virus-only sequences that may occur after the season cutoff.
+
+    Partial or malformed year-first dates are interpreted as intervals with
+    :func:`resolve_partial_date_interval_for_time_split`. For example, ``1996--``
+    represents 1996-01-01 through 1996-12-31. A sequence is retained only when
+    its latest plausible collection date is on or before the cutoff end date.
+    Missing, unparseable, or cutoff-spanning dates are excluded conservatively.
+
+    This function must be applied before virus-only downsampling.
+    """
+    if date_col not in sequence_pool_df.columns:
+        raise ValueError(
+            "Virus-only metadata must contain a collection-date column for "
+            f"season-based training: missing {date_col!r}."
+        )
+
+    cutoff_normalized, _ = parse_season_label(cutoff_season)
+    cutoff_end = cutoff_season_end_date(cutoff_normalized)
+    out = sequence_pool_df.copy()
+
+    intervals = out[date_col].apply(resolve_partial_date_interval_for_time_split)
+    out["date_interval_start"] = intervals.apply(lambda value: value[0])
+    out["date_interval_end"] = intervals.apply(lambda value: value[1])
+
+    date_known = out["date_interval_start"].notna() & out["date_interval_end"].notna()
+    keep_mask = date_known & (out["date_interval_end"] <= cutoff_end)
+    definitely_future = date_known & (out["date_interval_start"] > cutoff_end)
+    ambiguous_or_unparseable = ~(keep_mask | definitely_future)
+
+    out["cutoff_filter_status"] = "ambiguous_or_unparseable"
+    out.loc[keep_mask, "cutoff_filter_status"] = "past"
+    out.loc[definitely_future, "cutoff_filter_status"] = "future"
+
+    kept = out.loc[keep_mask].copy().reset_index(drop=True)
+    excluded = out.loc[~keep_mask].copy().reset_index(drop=True)
+
+    print(
+        "Virus-only cutoff-date filter: "
+        f"cutoff={cutoff_normalized}, cutoff_end={cutoff_end.date()}, "
+        f"input={len(out)}, retained_past={int(keep_mask.sum())}, "
+        f"excluded_future={int(definitely_future.sum())}, "
+        f"excluded_ambiguous_or_unparseable={int(ambiguous_or_unparseable.sum())}"
+    )
+
+    if kept.empty:
+        raise ValueError(
+            "Virus-only sequence pool is empty after cutoff-date filtering: "
+            f"cutoff_season={cutoff_normalized!r}."
+        )
+
+    return kept, excluded
 
 
 def _allocate_stratified_sample_counts(group_sizes: pd.Series, sample_n: int) -> pd.Series:
@@ -1554,10 +1630,6 @@ def main() -> None:
         drop_invalid=False,
     )
 
-    category_mappings_path = outputs_path / "category_mappings.json"
-    category_mappings = save_category_mappings(selected_df, category_mappings_path)
-    print(f"Saved category mappings: {category_mappings_path}")
-
     if args.split_mode == "season":
         selected_df_past, selected_df_future, selected_df_season_ambiguous = split_past_future_by_cutoff_season(
             selected_df,
@@ -1579,7 +1651,7 @@ def main() -> None:
         raise ValueError(f"Unknown split_mode: {args.split_mode!r}")
 
     selected_df_train_val, selected_df_test = split_dataframe_with_stratified_group_kfold(
-        selected_df_past, train_ratio=0.8, seed=args.random_seed
+        selected_df_past, train_ratio=0.9, seed=args.random_seed
     )
     selected_df_test = selected_df_test.copy()
     selected_df_test["weight"] = 1.0
@@ -1592,12 +1664,19 @@ def main() -> None:
         selected_df_train_val, train_ratio=8 / 9, seed=args.random_seed
     )
 
+    # Save only categories observed in the training split. Validation/test/future-only
+    # metadata values are therefore treated as unknown during external inference.
+    category_mappings_path = outputs_path / "category_mappings.json"
+    category_mappings = save_category_mappings(selected_df_train, category_mappings_path)
+    print(f"Saved training-only category mappings: {category_mappings_path}")
+
     split_summary = {
         "split_mode": args.split_mode,
         "cutoff_season": parse_season_label(args.cutoff_season)[0] if args.split_mode == "season" else None,
         "cutoff_season_end_date": str(cutoff_season_end_date(args.cutoff_season).date()) if args.split_mode == "season" else None,
         "season_col": args.season_col,
         "season_order_convention": "... SH2013 < NH2014 < SH2014 < NH2015 ...",
+        "target_random_split_ratio": {"train": 0.8, "validation": 0.1, "test": 0.1},
         "all_after_cleaning": len(selected_df_with_season),
         "rows_with_missing_or_unparseable_season_after_cleaning": int(selected_df_with_season["season_order"].isna().sum()),
         "season_split_ambiguous_or_unparseable_date": len(selected_df_season_ambiguous),
@@ -1636,6 +1715,17 @@ def main() -> None:
     print("Loading virus-only sequence pool...")
     sequence_pool_df = load_sequence_pool(sequence_pool_fasta, sequence_pool_metadata)
     sequence_pool_df = sequence_pool_df.reset_index(drop=True)
+
+    if args.split_mode == "season":
+        sequence_pool_df, excluded_sequence_pool_df = filter_sequence_pool_by_cutoff_date(
+            sequence_pool_df,
+            cutoff_season=args.cutoff_season,
+            date_col="date",
+        )
+        excluded_pool_path = outputs_path / "virus_only_sequence_pool_excluded_by_cutoff.csv"
+        excluded_sequence_pool_df.to_csv(excluded_pool_path, index=False)
+        print(f"Saved virus-only rows excluded by cutoff: {excluded_pool_path}")
+
     print(f"Virus-only sequence pool size before sampling: {len(sequence_pool_df)}")
     sequence_pool_df = sample_virus_only_pool(
         sequence_pool_df,
@@ -1648,11 +1738,20 @@ def main() -> None:
 
     print("Tokenizing sequences...")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    dataset_train = make_paired_dataset(selected_df_train, tokenizer, args.max_length)
-    dataset_val = make_paired_dataset(selected_df_val, tokenizer, args.max_length)
-    dataset_test = make_paired_dataset(selected_df_test, tokenizer, args.max_length)
-    dataset_future = make_paired_dataset(selected_df_future, tokenizer, args.max_length) if has_future else None
-    dataset_virus_only = make_virus_only_dataset(sequence_pool_df, tokenizer, args.max_length)
+    token_max_length = args.max_length + 2
+    print(
+        f"Raw amino-acid length={args.max_length}; "
+        f"ESM token_max_length={token_max_length} (<cls> + sequence + <eos>)"
+    )
+    dataset_train = make_paired_dataset(selected_df_train, tokenizer, token_max_length)
+    dataset_val = make_paired_dataset(selected_df_val, tokenizer, token_max_length)
+    dataset_test = make_paired_dataset(selected_df_test, tokenizer, token_max_length)
+    dataset_future = (
+        make_paired_dataset(selected_df_future, tokenizer, token_max_length)
+        if has_future
+        else None
+    )
+    dataset_virus_only = make_virus_only_dataset(sequence_pool_df, tokenizer, token_max_length)
     dataset_train_combined = ConcatDataset([dataset_train, dataset_virus_only])
 
     print("Fitting one-hot encoders...")
@@ -1661,8 +1760,6 @@ def main() -> None:
     ohe_date = make_one_hot_encoder(selected_df_train["date_category"])
     ohe_vp = make_one_hot_encoder(selected_df_train["virus_passage_category"])
     ohe_rp = make_one_hot_encoder(selected_df_train["reference_passage_category"])
-    set_encoders(ohe_virus, ohe_ref, ohe_vp, ohe_rp)
-
     joblib.dump(ohe_virus, outputs_path / "virus_encoder.joblib")
     joblib.dump(ohe_ref, outputs_path / "ref_encoder.joblib")
     joblib.dump(ohe_date, outputs_path / "date_encoder.joblib")
@@ -1739,6 +1836,7 @@ def main() -> None:
         lora_target_modules=lora_target_modules,
         lora_bias=args.lora_bias,
     )
+    model.set_encoders(ohe_virus, ohe_ref, ohe_vp, ohe_rp)
 
     optimizer = build_plant_optimizer(
         model,
@@ -1798,6 +1896,7 @@ def main() -> None:
         {
             "bf16": bf16,
             "fp16": fp16,
+            "token_max_length": token_max_length,
             "embed_scale_factor": embed_scale_factor,
             "model_dir": str(final_model_dir),
             "plant_model_config": model.get_plant_init_config(),
@@ -1878,7 +1977,7 @@ def main() -> None:
             & ~gisaid_df["seq"].str.contains("*", regex=False, na=False)
         ].copy()
         gisaid_df = gisaid_df[gisaid_df["seq"].str.len() == args.max_length].reset_index(drop=True)
-        encodes_gisaid = tokenize_sequences(gisaid_df["seq"].tolist(), tokenizer, args.max_length)
+        encodes_gisaid = tokenize_sequences(gisaid_df["seq"].tolist(), tokenizer, token_max_length)
         dataset_gisaid = TextDataset(encodes_gisaid)
         dataloader_gisaid = DataLoader(dataset_gisaid, batch_size=args.embedding_batch_size, shuffle=False)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
