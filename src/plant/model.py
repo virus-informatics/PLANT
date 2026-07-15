@@ -39,9 +39,10 @@ class semanticESM(PreTrainedModel):
     """PLANT/pLM-DMS model.
 
     During training, examples with ``labels == -10`` are treated as virus-only
-    examples and contribute only to the semantic regularization loss.  Examples
-    with real labels contribute to the supervised antigenic-distance loss plus
-    the semantic and optional local/global regularizers.
+    examples. Supervised antigenic-distance loss is computed only for labeled
+    pairs, while semantic, contrastive (CSE), and local/global regularization are
+    computed once over the unified set of paired viruses, paired references, and
+    virus-only sequences present in the mini-batch.
     """
 
     config_class = EsmConfig
@@ -62,8 +63,10 @@ class semanticESM(PreTrainedModel):
         CSE_W: float = 0.0,
         CSE_ALPHA: float = 0.0,
         SEMANTIC_W: float = 0.1,
-        CSE_W_VIRUS_ONLY: float = 0.0,
-        SEMANTIC_W_VIRUS_ONLY: float = 0.1,
+        # Deprecated compatibility arguments. Unified regularization uses CSE_W
+        # and SEMANTIC_W for every sequence in the mini-batch.
+        CSE_W_VIRUS_ONLY: Optional[float] = None,
+        SEMANTIC_W_VIRUS_ONLY: Optional[float] = None,
         CART_W: float = 0.1,
         LG_W: float = 0.0,
         reference_transform_mode: str = "none",
@@ -205,8 +208,9 @@ class semanticESM(PreTrainedModel):
         self.SEMANTIC_W = SEMANTIC_W
         self.CSE_ALPHA = CSE_ALPHA
         self.CART_W = CART_W
-        self.CSE_W_VIRUS_ONLY = CSE_W_VIRUS_ONLY
-        self.SEMANTIC_W_VIRUS_ONLY = SEMANTIC_W_VIRUS_ONLY
+        # Accept legacy checkpoint fields without retaining two independent sets
+        # of regularization weights. They are intentionally ignored.
+        del CSE_W_VIRUS_ONLY, SEMANTIC_W_VIRUS_ONLY
         self.LG_W = LG_W
         self.REF_TRANSFORM_W = REF_TRANSFORM_W
         self.REF_SHIFT_W = REF_SHIFT_W
@@ -398,25 +402,41 @@ class semanticESM(PreTrainedModel):
         embeddings2: torch.Tensor,
         margin: float = 1.0,
         alpha: float = 1.0,
+        same_sequence_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """Contrast two stochastic views without treating duplicate sequences as negatives."""
         if embeddings1.size(0) < 2:
             return embeddings1.sum() * 0.0
         distance_matrix = torch.cdist(embeddings1, embeddings2, p=2)
-        positive_loss = torch.mean(torch.diag(distance_matrix))
 
-        # Negative pairs should exclude the diagonal positive pairs.  Otherwise,
-        # the same sequence pairs are simultaneously pulled together by the
-        # positive term and pushed apart by the margin term.
-        if distance_matrix.size(0) == distance_matrix.size(1):
-            off_diag_mask = ~torch.eye(
+        if same_sequence_mask is None:
+            if distance_matrix.size(0) != distance_matrix.size(1):
+                raise ValueError(
+                    "same_sequence_mask is required for non-square CSE distance matrices."
+                )
+            same_sequence_mask = torch.eye(
                 distance_matrix.size(0),
                 device=distance_matrix.device,
                 dtype=torch.bool,
             )
-            negative_distances = distance_matrix[off_diag_mask]
         else:
-            negative_distances = distance_matrix.reshape(-1)
+            same_sequence_mask = same_sequence_mask.to(
+                device=distance_matrix.device,
+                dtype=torch.bool,
+            )
+            if same_sequence_mask.shape != distance_matrix.shape:
+                raise ValueError(
+                    "same_sequence_mask shape must match the CSE distance matrix: "
+                    f"{tuple(same_sequence_mask.shape)} != {tuple(distance_matrix.shape)}."
+                )
 
+        positive_distances = distance_matrix[same_sequence_mask]
+        if positive_distances.numel() == 0:
+            positive_loss = embeddings1.sum() * 0.0
+        else:
+            positive_loss = torch.mean(positive_distances)
+
+        negative_distances = distance_matrix[~same_sequence_mask]
         if negative_distances.numel() == 0:
             negative_loss = embeddings1.sum() * 0.0
         else:
@@ -430,6 +450,7 @@ class semanticESM(PreTrainedModel):
         latents: torch.Tensor,
         k_local: int = 3,
         margin_global: float = 0.125,
+        same_sequence_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if latents.size(0) < 2:
             return latents.sum() * 0.0
@@ -445,7 +466,23 @@ class semanticESM(PreTrainedModel):
         else:
             local_loss = latents.sum() * 0.0
 
-        margin_mask = dists_no_self < margin_global
+        if same_sequence_mask is None:
+            same_sequence_mask = eye_mask
+        else:
+            same_sequence_mask = same_sequence_mask.to(
+                device=dists.device,
+                dtype=torch.bool,
+            )
+            if same_sequence_mask.shape != dists.shape:
+                raise ValueError(
+                    "same_sequence_mask shape must match the LG distance matrix: "
+                    f"{tuple(same_sequence_mask.shape)} != {tuple(dists.shape)}."
+                )
+            same_sequence_mask = same_sequence_mask | eye_mask
+
+        # Identical sequences may occur repeatedly as references or in both the
+        # paired and virus-only pools. They must not repel each other globally.
+        margin_mask = (dists_no_self < margin_global) & ~same_sequence_mask
         repel_loss = torch.clamp(margin_global - dists_no_self, min=0.0)
         global_loss = torch.sum(repel_loss * margin_mask) / (margin_mask.sum() + 1e-8)
         return local_loss + global_loss
@@ -515,14 +552,9 @@ class semanticESM(PreTrainedModel):
         predictions_cart: torch.Tensor,
         targets: torch.Tensor,
         censors: torch.Tensor,
-        virus_regressor_out: torch.Tensor,
-        virus_regressor_out2: torch.Tensor,
-        reference_regressor_out: torch.Tensor,
-        reference_regressor_out2: torch.Tensor,
-        virus_embedding_original: torch.Tensor,
-        reference_embedding_original: torch.Tensor,
         weight: torch.Tensor,
     ) -> torch.Tensor:
+        """Supervised censored regression loss for labeled antigenic pairs."""
         uncensored_loss = self.mse_loss_wo_mean(predictions, targets) * (1 - censors)
         censored_loss = self.mse_loss_wo_mean(
             predictions, torch.maximum(predictions, targets)
@@ -539,69 +571,65 @@ class semanticESM(PreTrainedModel):
         uncensored_loss_cart = uncensored_loss_cart * weight
         censored_loss_cart = censored_loss_cart * weight
 
-        combined_latents = torch.cat([virus_regressor_out, reference_regressor_out], dim=0)
-        combined_latents2 = torch.cat([virus_regressor_out2, reference_regressor_out2], dim=0)
-        combined_latents_original = torch.cat(
-            [virus_embedding_original, reference_embedding_original], dim=0
-        )
-
-        contrastive_loss_value = self.contrastive_loss_semantic(
-            combined_latents, combined_latents2, alpha=self.CSE_ALPHA
-        )
-        if self.LG_W != 0.0:
-            local_global_loss_value = self.local_global_loss(
-                combined_latents, k_local=3, margin_global=0.125
-            )
-        else:
-            local_global_loss_value = combined_latents.new_tensor(0.0)
-        semantic_loss = self.compute_semantic_loss(
-            combined_latents,
-            combined_latents_original,
-            self.embed_scale,
-            self.embed_scale_factor,
-        )
-
         return (
             torch.mean(uncensored_loss) * self.MAIN_W
             + torch.mean(censored_loss) * self.MAIN_W
             + torch.mean(uncensored_loss_cart) * self.CART_W
             + torch.mean(censored_loss_cart) * self.CART_W
-            + contrastive_loss_value * self.CSE_W
-            + semantic_loss * self.SEMANTIC_W
-            + local_global_loss_value * self.LG_W
         )
 
-    def custom_loss_only_semantic(
+    def compute_unified_regularization_loss(
         self,
-        virus_regressor_out: torch.Tensor,
-        virus_regressor_out2: torch.Tensor,
-        virus_embedding_original: torch.Tensor,
+        latents_view1: torch.Tensor,
+        *,
+        latents_original: Optional[torch.Tensor] = None,
+        latents_view2: Optional[torch.Tensor] = None,
+        same_sequence_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if virus_regressor_out.size(0) < 2:
-            # A singleton virus-only batch has no pairwise semantic relation. Return
-            # a differentiable zero so Trainer.backward() remains valid.
-            return virus_regressor_out.sum() * 0.0
+        """Regularize one unified sequence set exactly once per mini-batch.
 
-        contrastive_loss_value = self.contrastive_loss_semantic(
-            virus_regressor_out, virus_regressor_out2, alpha=self.CSE_ALPHA
-        )
-        if self.LG_W != 0.0:
-            local_global_loss_value = self.local_global_loss(
-                virus_regressor_out, k_local=3, margin_global=0.125
+        ``latents_view1`` contains every virus input in the batch (paired and
+        virus-only) followed, when present, by the labeled reference sequences.
+        Reference coordinates are supplied in the shared sequence space before
+        any serum-side reference transform is applied.
+        """
+        zero = latents_view1.sum() * 0.0
+        total = zero
+
+        if self.SEMANTIC_W != 0.0:
+            if latents_original is None:
+                raise ValueError(
+                    "latents_original is required when SEMANTIC_W is non-zero."
+                )
+            semantic_loss = self.compute_semantic_loss(
+                latents_view1,
+                latents_original,
+                self.embed_scale,
+                self.embed_scale_factor,
             )
-        else:
-            local_global_loss_value = virus_regressor_out.new_tensor(0.0)
-        semantic_loss = self.compute_semantic_loss(
-            virus_regressor_out,
-            virus_embedding_original,
-            self.embed_scale,
-            self.embed_scale_factor,
-        )
-        return (
-            semantic_loss * self.SEMANTIC_W_VIRUS_ONLY
-            + contrastive_loss_value * self.CSE_W_VIRUS_ONLY
-            + local_global_loss_value * self.LG_W
-        )
+            total = total + semantic_loss * self.SEMANTIC_W
+
+        if self.CSE_W != 0.0:
+            if latents_view2 is None:
+                raise ValueError("latents_view2 is required when CSE_W is non-zero.")
+            cse_loss = self.contrastive_loss_semantic(
+                latents_view1,
+                latents_view2,
+                alpha=self.CSE_ALPHA,
+                same_sequence_mask=same_sequence_mask,
+            )
+            total = total + cse_loss * self.CSE_W
+
+        if self.LG_W != 0.0:
+            local_global_loss = self.local_global_loss(
+                latents_view1,
+                k_local=3,
+                margin_global=0.125,
+                same_sequence_mask=same_sequence_mask,
+            )
+            total = total + local_global_loss * self.LG_W
+
+        return total
 
     def get_plant_init_config(self) -> dict:
         """Return constructor arguments needed to reload this PLANT model."""
@@ -619,8 +647,6 @@ class semanticESM(PreTrainedModel):
             "CSE_W": self.CSE_W,
             "CSE_ALPHA": self.CSE_ALPHA,
             "SEMANTIC_W": self.SEMANTIC_W,
-            "CSE_W_VIRUS_ONLY": self.CSE_W_VIRUS_ONLY,
-            "SEMANTIC_W_VIRUS_ONLY": self.SEMANTIC_W_VIRUS_ONLY,
             "CART_W": self.CART_W,
             "LG_W": self.LG_W,
             "reference_transform_mode": self.reference_transform_mode,
@@ -745,13 +771,12 @@ class semanticESM(PreTrainedModel):
         input_ids_virus = input_ids_virus.to(device)
         attention_mask_virus = attention_mask_virus.to(device)
 
+        # This tensor contains both labeled paired viruses and virus-only rows.
         virus_regressor_out = self.regressor(
             self.encode_sequence(self.esm_model, input_ids_virus, attention_mask_virus)
         )
 
-        # Fast path for pure inference: sequence -> PLANT coordinates.
-        # Keep this before the optional second stochastic forward pass so
-        # inference and all-sequence embedding do not run ESM twice.
+        # Fast path for pure sequence -> coordinate inference.
         if labels is None and input_ids_reference is None:
             return ModelOutput(
                 loss=torch.tensor(0.0, device=device),
@@ -759,13 +784,13 @@ class semanticESM(PreTrainedModel):
                 hidden_state_virus=virus_regressor_out,
             )
 
-        needs_virus_cse = (self.CSE_W != 0.0) or (self.CSE_W_VIRUS_ONLY != 0.0)
-        if needs_virus_cse:
+        needs_cse = self.CSE_W != 0.0
+        if needs_cse:
             virus_regressor_out2 = self.regressor(
                 self.encode_sequence(self.esm_model, input_ids_virus, attention_mask_virus)
             )
         else:
-            virus_regressor_out2 = virus_regressor_out
+            virus_regressor_out2 = None
 
         batch_size = input_ids_virus.size(0)
         if labels is None:
@@ -781,22 +806,23 @@ class semanticESM(PreTrainedModel):
         input_ids_reference = input_ids_reference.to(device)
         attention_mask_reference = attention_mask_reference.to(device)
 
-        virus_embedding_original = self.extract_original_pooled_embeddings(
-            input_ids_virus, attention_mask_virus
+        # Unified regularization always starts with every virus row in the batch.
+        regularization_latents_view1 = [virus_regressor_out]
+        regularization_input_ids = [input_ids_virus]
+        regularization_attention_masks = [attention_mask_virus]
+        regularization_latents_view2 = (
+            [virus_regressor_out2] if virus_regressor_out2 is not None else None
         )
-
-        # Semantic-only loss for virus-only examples.
-        no_label_mask = ~has_labels_mask
-        if no_label_mask.any():
-            loss_no_labels = self.custom_loss_only_semantic(
-                virus_regressor_out[no_label_mask],
-                virus_regressor_out2[no_label_mask],
-                virus_embedding_original[no_label_mask],
+        regularization_original = [] if self.SEMANTIC_W != 0.0 else None
+        if regularization_original is not None:
+            regularization_original.append(
+                self.extract_original_pooled_embeddings(
+                    input_ids_virus,
+                    attention_mask_virus,
+                )
             )
-        else:
-            loss_no_labels = virus_regressor_out.sum() * 0.0
 
-        # Supervised antigenic-distance loss for paired examples.
+        # Supervised antigenic-distance loss is restricted to labeled pairs.
         if has_labels_mask.any():
             input_ids_reference_labeled = input_ids_reference[has_labels_mask]
             attention_mask_reference_labeled = attention_mask_reference[has_labels_mask]
@@ -808,10 +834,13 @@ class semanticESM(PreTrainedModel):
                     attention_mask_reference_labeled,
                 )
             )
-            reference_regressor_out = self.apply_reference_transform(
-                reference_regressor_out_shared
-            )
-            if self.CSE_W != 0.0:
+            # Use the shared (pre-transform) reference coordinates for all sequence
+            # regularizers, and only use the transformed coordinates for prediction.
+            regularization_latents_view1.append(reference_regressor_out_shared)
+            regularization_input_ids.append(input_ids_reference_labeled)
+            regularization_attention_masks.append(attention_mask_reference_labeled)
+
+            if needs_cse:
                 reference_regressor_out2 = self.regressor(
                     self.encode_sequence(
                         self.esm_model,
@@ -819,8 +848,20 @@ class semanticESM(PreTrainedModel):
                         attention_mask_reference_labeled,
                     )
                 )
-            else:
-                reference_regressor_out2 = reference_regressor_out_shared
+                assert regularization_latents_view2 is not None
+                regularization_latents_view2.append(reference_regressor_out2)
+
+            if regularization_original is not None:
+                regularization_original.append(
+                    self.extract_original_pooled_embeddings(
+                        input_ids_reference_labeled,
+                        attention_mask_reference_labeled,
+                    )
+                )
+
+            reference_regressor_out = self.apply_reference_transform(
+                reference_regressor_out_shared
+            )
             distance = torch.norm(
                 virus_regressor_out[has_labels_mask] - reference_regressor_out,
                 p=2,
@@ -863,7 +904,8 @@ class semanticESM(PreTrainedModel):
 
                     parts = [
                         self.encode_one_hot(
-                            encoder, tensor.to(device)[has_labels_mask]
+                            encoder,
+                            tensor.to(device)[has_labels_mask],
                         )
                         for encoder, tensor in zip(effect_encoders, effect_tensors)
                     ]
@@ -874,49 +916,75 @@ class semanticESM(PreTrainedModel):
             observed_distance = distance + systematic_error
             logits_labeled = torch.cat((observed_distance, distance), dim=1)
 
-            reference_embedding_original = self.extract_original_pooled_embeddings(
-                input_ids_reference_labeled,
-                attention_mask_reference_labeled,
-            )
-
             if censors is None:
                 censors = torch.zeros(batch_size, dtype=torch.float, device=device)
             if weight is None:
                 weight = torch.ones(batch_size, dtype=torch.float, device=device)
 
-            combined_loss = self.custom_loss(
+            supervised_loss = self.custom_loss(
                 observed_distance,
                 distance,
                 labels[has_labels_mask].view(-1, 1),
                 censors.to(device)[has_labels_mask].view(-1, 1),
-                virus_regressor_out[has_labels_mask],
-                virus_regressor_out2[has_labels_mask],
-                reference_regressor_out_shared,
-                reference_regressor_out2,
-                virus_embedding_original[has_labels_mask],
-                reference_embedding_original,
                 weight.to(device)[has_labels_mask].view(-1, 1),
             )
-            combined_loss = combined_loss + (
+            supervised_loss = supervised_loss + (
                 torch.mean(systematic_error1**2) + torch.mean(systematic_error2**2)
             ) * 1.0e-4
-            combined_loss = combined_loss + self.reference_transform_regularization(
+            supervised_loss = supervised_loss + self.reference_transform_regularization(
                 reference_regressor_out_shared,
                 reference_regressor_out,
             )
 
-            # Trainer.predict expects batch-aligned outputs.  Virus-only rows get NaN.
+            # Trainer.predict expects batch-aligned outputs. Virus-only rows get NaN.
             logits = torch.full(
-                (batch_size, 2), float("nan"), device=device, dtype=logits_labeled.dtype
+                (batch_size, 2),
+                float("nan"),
+                device=device,
+                dtype=logits_labeled.dtype,
             )
             logits[has_labels_mask] = logits_labeled
         else:
-            combined_loss = virus_regressor_out.sum() * 0.0
+            supervised_loss = virus_regressor_out.sum() * 0.0
             logits = None
 
-        total_loss = combined_loss + loss_no_labels
+        all_latents_view1 = torch.cat(regularization_latents_view1, dim=0)
+        all_latents_view2 = (
+            torch.cat(regularization_latents_view2, dim=0)
+            if regularization_latents_view2 is not None
+            else None
+        )
+        all_original = (
+            torch.cat(regularization_original, dim=0)
+            if regularization_original is not None
+            else None
+        )
+        same_sequence_mask = None
+        if self.CSE_W != 0.0 or self.LG_W != 0.0:
+            all_regularization_input_ids = torch.cat(regularization_input_ids, dim=0)
+            all_regularization_attention_masks = torch.cat(
+                regularization_attention_masks,
+                dim=0,
+            )
+            same_sequence_mask = (
+                all_regularization_input_ids[:, None, :]
+                == all_regularization_input_ids[None, :, :]
+            ).all(dim=-1) & (
+                all_regularization_attention_masks[:, None, :]
+                == all_regularization_attention_masks[None, :, :]
+            ).all(dim=-1)
+
+        regularization_loss = self.compute_unified_regularization_loss(
+            all_latents_view1,
+            latents_original=all_original,
+            latents_view2=all_latents_view2,
+            same_sequence_mask=same_sequence_mask,
+        )
+
+        total_loss = supervised_loss + regularization_loss
         return ModelOutput(
             loss=total_loss,
             logits=logits,
             hidden_state_virus=virus_regressor_out,
         )
+

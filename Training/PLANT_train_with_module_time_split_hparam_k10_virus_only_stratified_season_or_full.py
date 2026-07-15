@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import calendar
 import datetime as dt
+from functools import partial
 import json
 import random
 import re
@@ -31,7 +32,12 @@ import torch
 from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.preprocessing import OneHotEncoder
 from torch.utils.data import ConcatDataset, DataLoader
-from transformers import AutoTokenizer, EsmConfig, TrainingArguments
+from transformers import (
+    AutoTokenizer,
+    EarlyStoppingCallback,
+    EsmConfig,
+    TrainingArguments,
+)
 
 # Make src/plant importable when this script is run from the repository root.
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -119,18 +125,110 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--embedding-batch-size", "--embedding_batch_size", dest="embedding_batch_size", default=128, type=int)
     parser.add_argument("--num-steps", "--num_steps", dest="num_steps", default=20000, type=int)
     parser.add_argument("--random-seed", "--random_seed", dest="random_seed", default=42, type=int)
-    parser.add_argument("--learning-rate", "--learning_rate", dest="learning_rate", default=1e-4, type=float)
+    parser.add_argument(
+        "--learning-rate",
+        "--learning_rate",
+        dest="learning_rate",
+        default=1e-4,
+        type=float,
+        help=(
+            "Backward-compatible shared learning-rate fallback. Component-specific "
+            "rates below override it when supplied."
+        ),
+    )
+    parser.add_argument(
+        "--encoder-learning-rate",
+        "--encoder_learning_rate",
+        dest="encoder_learning_rate",
+        default=3e-5,
+        type=float,
+        help=(
+            "Learning rate for trainable ESM encoder parameters (LoRA or full fine-tuning). "
+            "Default: 3e-5."
+        ),
+    )
+    parser.add_argument(
+        "--regressor-learning-rate",
+        "--regressor_learning_rate",
+        dest="regressor_learning_rate",
+        default=3e-4,
+        type=float,
+        help=(
+            "Learning rate for the antigenic-map regressor. Default: 3e-4."
+        ),
+    )
+    parser.add_argument(
+        "--auxiliary-learning-rate",
+        "--auxiliary_learning_rate",
+        dest="auxiliary_learning_rate",
+        default=1e-4,
+        type=float,
+        help=(
+            "Learning rate for systematic-error heads, reference transforms, and "
+            "embed_scale. Default: 1e-4."
+        ),
+    )
     parser.add_argument("--weight-decay", "--weight_decay", dest="weight_decay", default=0.01, type=float)
     parser.add_argument("--reg-weight-decay", "--reg_weight_decay", dest="reg_weight_decay", default=0.01, type=float)
     parser.add_argument("--max-saves", "--max_saves", dest="max_saves", default=1, type=int)
     parser.add_argument("--save-steps", "--save_steps", dest="save_steps", default=1000, type=int)
     parser.add_argument("--eval-steps", "--eval_steps", dest="eval_steps", default=1000, type=int)
+    parser.add_argument(
+        "--selection-mae-lambda",
+        "--selection_mae_lambda",
+        dest="selection_mae_lambda",
+        default=1.0,
+        type=float,
+        help=(
+            "Lambda in the maximized validation score: censor-cap Pearson + "
+            "censor-cap Spearman - lambda * censor-cap MAE."
+        ),
+    )
+    parser.add_argument(
+        "--early-stopping-patience",
+        "--early_stopping_patience",
+        dest="early_stopping_patience",
+        default=5,
+        type=int,
+        help=(
+            "Number of evaluations without improvement before stopping. "
+            "Set to 0 to disable early stopping."
+        ),
+    )
+    parser.add_argument(
+        "--early-stopping-threshold",
+        "--early_stopping_threshold",
+        dest="early_stopping_threshold",
+        default=0.001,
+        type=float,
+        help="Minimum validation-score improvement counted by early stopping.",
+    )
     parser.add_argument("--warmup-ratio", "--warmup_ratio", dest="warmup_ratio", default=0.1, type=float)
     parser.add_argument("--num-samples-per-combination", "--num_samples_per_combination", dest="num_samples_per_combination", default=1, type=int)
     parser.add_argument("--CSE-w", "--CSE_w", dest="CSE_w", default=0.0, type=float)
-    parser.add_argument("--CSE-w-virus-only", "--CSE_w_virus_only", dest="CSE_w_virus_only", default=0.0, type=float)
+    parser.add_argument(
+        "--CSE-w-virus-only",
+        "--CSE_w_virus_only",
+        dest="CSE_w_virus_only",
+        default=None,
+        type=float,
+        help=(
+            "Deprecated compatibility option; ignored. Unified CSE uses --CSE-w "
+            "for paired viruses, references, and virus-only sequences."
+        ),
+    )
     parser.add_argument("--semantic-w", "--semantic_w", dest="semantic_w", default=0.1, type=float)
-    parser.add_argument("--semantic-w-virus-only", "--semantic_w_virus_only", dest="semantic_w_virus_only", default=0.1, type=float)
+    parser.add_argument(
+        "--semantic-w-virus-only",
+        "--semantic_w_virus_only",
+        dest="semantic_w_virus_only",
+        default=None,
+        type=float,
+        help=(
+            "Deprecated compatibility option; ignored. Unified semantic loss uses "
+            "--semantic-w for paired viruses, references, and virus-only sequences."
+        ),
+    )
     parser.add_argument("--cart-w", "--cart_w", dest="cart_w", default=0.1, type=float)
     parser.add_argument("--dropout-regressor", "--dropout_regressor", dest="dropout_regressor", default=0.05, type=float)
     parser.add_argument("--reg-intermediate-dim", "--reg_intermediate_dim", dest="reg_intermediate_dim", default=256, type=int)
@@ -313,6 +411,29 @@ def parse_args() -> argparse.Namespace:
         parser.error(
             "--freeze-esm and --use-lora cannot be set simultaneously. "
             "Please specify --no-use-lora explicitly when using --freeze-esm."
+        )
+    if args.learning_rate <= 0:
+        parser.error("--learning-rate must be > 0.")
+    for option_name in (
+        "encoder_learning_rate",
+        "regressor_learning_rate",
+        "auxiliary_learning_rate",
+    ):
+        value = getattr(args, option_name)
+        if value is not None and value <= 0:
+            parser.error(f"--{option_name.replace('_', '-')} must be > 0.")
+    if args.selection_mae_lambda < 0:
+        parser.error("--selection-mae-lambda must be >= 0.")
+    if args.early_stopping_patience < 0:
+        parser.error("--early-stopping-patience must be >= 0.")
+    if args.early_stopping_threshold < 0:
+        parser.error("--early-stopping-threshold must be >= 0.")
+    if args.eval_steps <= 0 or args.save_steps <= 0:
+        parser.error("--eval-steps and --save-steps must both be > 0.")
+    if args.save_steps % args.eval_steps != 0:
+        parser.error(
+            "With load_best_model_at_end=True, --save-steps must be an integer "
+            "multiple of --eval-steps."
         )
 
     return args
@@ -1359,8 +1480,12 @@ def compute_prediction_metrics(
     return metrics
 
 
-def compute_metrics_for_trainer(eval_pred) -> dict[str, float]:
-    """Compute validation metrics used by Hugging Face Trainer."""
+def compute_metrics_for_trainer(
+    eval_pred,
+    *,
+    selection_mae_lambda: float = 1.0,
+) -> dict[str, float]:
+    """Compute validation metrics and the maximized checkpoint-selection score."""
     logits = _extract_logits(eval_pred.predictions)
     labels, censors = _extract_labels_and_censors(eval_pred.label_ids)
 
@@ -1377,7 +1502,7 @@ def compute_metrics_for_trainer(eval_pred) -> dict[str, float]:
         cartography_distance,
     )
 
-    return compute_prediction_metrics(
+    metrics = compute_prediction_metrics(
         labels,
         censors,
         {
@@ -1387,6 +1512,29 @@ def compute_metrics_for_trainer(eval_pred) -> dict[str, float]:
             "predicted_dist_cartography_censor_cap": predicted_dist_cartography_censor_cap,
         },
     )
+
+    components = np.asarray(
+        [
+            metrics["pearson_censor_cap"],
+            metrics["spearman_censor_cap"],
+            metrics["mae_censor_cap"],
+        ],
+        dtype=float,
+    )
+    if np.all(np.isfinite(components)):
+        selection_score = (
+            components[0]
+            + components[1]
+            - float(selection_mae_lambda) * components[2]
+        )
+    else:
+        # NaN checkpoint metrics can prevent Trainer from identifying a best model
+        # and can stall early stopping. Keep the original component metrics as NaN
+        # for diagnosis, but assign an unambiguously poor finite selection score.
+        selection_score = -1.0e9
+
+    metrics["selection_score_censor_cap"] = float(selection_score)
+    return metrics
 
 
 def compute_prediction_metrics_from_dataframe(df: pd.DataFrame) -> dict[str, float]:
@@ -1576,6 +1724,21 @@ def main() -> None:
     start = time.time()
     args = parse_args()
     set_seed(args.random_seed)
+
+    deprecated_regularization_args = {
+        "--CSE-w-virus-only": args.CSE_w_virus_only,
+        "--semantic-w-virus-only": args.semantic_w_virus_only,
+    }
+    supplied_deprecated = {
+        name: value
+        for name, value in deprecated_regularization_args.items()
+        if value is not None
+    }
+    if supplied_deprecated:
+        print(
+            "Warning: split virus-only regularization weights are deprecated and "
+            f"ignored under unified regularization: {supplied_deprecated}"
+        )
 
     storage_path = Path(args.directory).resolve()
     if args.split_mode == "season":
@@ -1814,9 +1977,7 @@ def main() -> None:
         virus_effects_len=virus_effects_len,
         embed_scale_factor=embed_scale_factor,
         CSE_W=args.CSE_w,
-        CSE_W_VIRUS_ONLY=args.CSE_w_virus_only,
         SEMANTIC_W=args.semantic_w,
-        SEMANTIC_W_VIRUS_ONLY=args.semantic_w_virus_only,
         MAIN_W=1.0,
         CART_W=args.cart_w,
         intermediate_dim=args.reg_intermediate_dim,
@@ -1841,8 +2002,32 @@ def main() -> None:
     optimizer = build_plant_optimizer(
         model,
         learning_rate=args.learning_rate,
+        encoder_learning_rate=args.encoder_learning_rate,
+        regressor_learning_rate=args.regressor_learning_rate,
+        auxiliary_learning_rate=args.auxiliary_learning_rate,
         weight_decay=args.weight_decay,
         regressor_weight_decay=args.reg_weight_decay,
+    )
+    resolved_encoder_lr = (
+        args.learning_rate
+        if args.encoder_learning_rate is None
+        else args.encoder_learning_rate
+    )
+    resolved_regressor_lr = (
+        args.learning_rate
+        if args.regressor_learning_rate is None
+        else args.regressor_learning_rate
+    )
+    resolved_auxiliary_lr = (
+        resolved_regressor_lr
+        if args.auxiliary_learning_rate is None
+        else args.auxiliary_learning_rate
+    )
+    print(
+        "Optimizer learning rates: "
+        f"encoder={resolved_encoder_lr:.6g}, "
+        f"regressor={resolved_regressor_lr:.6g}, "
+        f"auxiliary={resolved_auxiliary_lr:.6g}"
     )
 
     training_args = make_training_args(
@@ -1863,10 +2048,26 @@ def main() -> None:
         remove_unused_columns=False,
         label_names=["labels", "censors"],
         load_best_model_at_end=True,
-        metric_for_best_model="eval_pearson_censor_cap",
+        metric_for_best_model="eval_selection_score_censor_cap",
         greater_is_better=True,
         report_to="none",
     )
+
+    trainer_callbacks = []
+    if args.early_stopping_patience > 0:
+        trainer_callbacks.append(
+            EarlyStoppingCallback(
+                early_stopping_patience=args.early_stopping_patience,
+                early_stopping_threshold=args.early_stopping_threshold,
+            )
+        )
+        print(
+            "Early stopping enabled: "
+            f"patience={args.early_stopping_patience}, "
+            f"threshold={args.early_stopping_threshold:.6g}"
+        )
+    else:
+        print("Early stopping disabled (--early-stopping-patience=0).")
 
     trainer = BalancedCombinationTrainer(
         model=model,
@@ -1876,7 +2077,11 @@ def main() -> None:
         num_samples_per_combination=args.num_samples_per_combination,
         random_seed=args.random_seed,
         optimizers=(optimizer, None),
-        compute_metrics=compute_metrics_for_trainer,
+        compute_metrics=partial(
+            compute_metrics_for_trainer,
+            selection_mae_lambda=args.selection_mae_lambda,
+        ),
+        callbacks=trainer_callbacks,
     )
 
     print("Starting training...")
@@ -1898,6 +2103,15 @@ def main() -> None:
             "fp16": fp16,
             "token_max_length": token_max_length,
             "embed_scale_factor": embed_scale_factor,
+            "resolved_learning_rates": {
+                "encoder": resolved_encoder_lr,
+                "regressor": resolved_regressor_lr,
+                "auxiliary": resolved_auxiliary_lr,
+            },
+            "validation_selection_metric": (
+                "pearson_censor_cap + spearman_censor_cap - "
+                f"{args.selection_mae_lambda} * mae_censor_cap"
+            ),
             "model_dir": str(final_model_dir),
             "plant_model_config": model.get_plant_init_config(),
             "category_mappings_file": str(category_mappings_path),

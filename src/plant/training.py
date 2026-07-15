@@ -138,11 +138,11 @@ class BalancedCombinationSampler(Sampler[int]):
 class NoSingletonBatchSampler(BatchSampler):
     """Batch sampler that drops only a final singleton batch.
 
-    A batch containing exactly one virus-only example has no pairwise semantic
-    relation. Although the model returns a differentiable zero for safety, such a
-    batch would still consume an optimizer/scheduler step. When ``drop_last=False``,
-    keep ordinary partial batches but omit a final batch only when it has one item.
-    This avoids both a no-op step and a batch larger than the configured batch size.
+    A final one-item batch can contain too few sequences to define any pairwise
+    regularization and may therefore become a no-op optimizer step. When
+    ``drop_last=False``, keep ordinary partial batches but omit only a final
+    singleton batch. This avoids both a no-op step and a batch larger than the
+    configured batch size.
     """
 
     def __iter__(self):
@@ -223,53 +223,132 @@ def build_plant_optimizer(
     learning_rate: float,
     weight_decay: float,
     regressor_weight_decay: float,
+    encoder_learning_rate: Optional[float] = None,
+    regressor_learning_rate: Optional[float] = None,
+    auxiliary_learning_rate: Optional[float] = None,
 ) -> AdamW:
-    """Create an AdamW optimizer with a separate regressor weight decay."""
+    """Create AdamW parameter groups with independently configurable LRs.
+
+    Parameters
+    ----------
+    learning_rate:
+        Backward-compatible shared fallback learning rate.
+    encoder_learning_rate:
+        Learning rate for trainable parameters under ``esm_model`` (LoRA adapters
+        or the fully fine-tuned ESM encoder). Defaults to ``learning_rate``.
+    regressor_learning_rate:
+        Learning rate for the antigenic-map regressor. Defaults to
+        ``learning_rate``.
+    auxiliary_learning_rate:
+        Learning rate for systematic-error heads, reference transforms, and
+        ``embed_scale``. Defaults to ``regressor_learning_rate`` because these are
+        task-specific parameters rather than pretrained encoder parameters.
+    """
+    encoder_lr = (
+        float(learning_rate)
+        if encoder_learning_rate is None
+        else float(encoder_learning_rate)
+    )
+    regressor_lr = (
+        float(learning_rate)
+        if regressor_learning_rate is None
+        else float(regressor_learning_rate)
+    )
+    auxiliary_lr = (
+        regressor_lr
+        if auxiliary_learning_rate is None
+        else float(auxiliary_learning_rate)
+    )
+
+    for lr_name, lr_value in (
+        ("learning_rate", learning_rate),
+        ("encoder_learning_rate", encoder_lr),
+        ("regressor_learning_rate", regressor_lr),
+        ("auxiliary_learning_rate", auxiliary_lr),
+    ):
+        if lr_value <= 0:
+            raise ValueError(f"{lr_name} must be > 0, got {lr_value}.")
+
     no_decay = ("bias", "LayerNorm.weight", "layer_norm.weight")
     # These small scalar / near-identity parameters have explicit losses or
-    # learned scaling semantics.  Applying AdamW weight decay would pull them
-    # toward zero rather than toward their intended neutral values.
+    # learned scaling semantics. AdamW decay would pull them toward zero rather
+    # than toward their intended neutral values.
     explicit_no_weight_decay = (
         "embed_scale",
         "reference_transform",
         "reference_log_scale",
         "reference_shift",
     )
-    regressor_params = []
-    other_params = []
+
+    grouped: dict[tuple[str, bool], list[tuple[str, nn.Parameter]]] = {}
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if "regressor" in name:
-            regressor_params.append((name, param))
-        else:
-            other_params.append((name, param))
 
-    optimizer_grouped_parameters = [
-        {
-            "params": [p for _, p in regressor_params],
-            "weight_decay": regressor_weight_decay,
-        },
-        {
-            "params": [
-                p
-                for n, p in other_params
-                if not any(nd in n for nd in no_decay)
-                and not any(key in n for key in explicit_no_weight_decay)
-            ],
-            "weight_decay": weight_decay,
-        },
-        {
-            "params": [
-                p
-                for n, p in other_params
-                if any(nd in n for nd in no_decay)
-                or any(key in n for key in explicit_no_weight_decay)
-            ],
-            "weight_decay": 0.0,
-        },
-    ]
-    return AdamW(optimizer_grouped_parameters, lr=learning_rate)
+        if name.startswith("esm_model."):
+            family = "encoder"
+        elif name.startswith("regressor."):
+            family = "regressor"
+        else:
+            family = "auxiliary"
+
+        use_decay = not (
+            any(nd in name for nd in no_decay)
+            or any(key in name for key in explicit_no_weight_decay)
+        )
+        grouped.setdefault((family, use_decay), []).append((name, param))
+
+    family_lr = {
+        "encoder": encoder_lr,
+        "regressor": regressor_lr,
+        "auxiliary": auxiliary_lr,
+    }
+    family_weight_decay = {
+        "encoder": float(weight_decay),
+        "regressor": float(regressor_weight_decay),
+        "auxiliary": float(weight_decay),
+    }
+
+    optimizer_grouped_parameters = []
+    seen_param_ids: set[int] = set()
+    for family in ("encoder", "regressor", "auxiliary"):
+        for use_decay in (True, False):
+            named_params = grouped.get((family, use_decay), [])
+            if not named_params:
+                continue
+            params = [param for _, param in named_params]
+            duplicate_ids = [id(param) for param in params if id(param) in seen_param_ids]
+            if duplicate_ids:
+                raise RuntimeError(
+                    f"Optimizer parameter grouping duplicated {len(duplicate_ids)} "
+                    f"parameter(s) in family {family!r}."
+                )
+            seen_param_ids.update(id(param) for param in params)
+            optimizer_grouped_parameters.append(
+                {
+                    "params": params,
+                    "lr": family_lr[family],
+                    "weight_decay": (
+                        family_weight_decay[family] if use_decay else 0.0
+                    ),
+                    "group_name": f"{family}_{'decay' if use_decay else 'no_decay'}",
+                }
+            )
+
+    expected_param_ids = {
+        id(param) for param in model.parameters() if param.requires_grad
+    }
+    if seen_param_ids != expected_param_ids:
+        missing = len(expected_param_ids - seen_param_ids)
+        extra = len(seen_param_ids - expected_param_ids)
+        raise RuntimeError(
+            "Optimizer parameter grouping is incomplete: "
+            f"missing={missing}, extra={extra}."
+        )
+    if not optimizer_grouped_parameters:
+        raise ValueError("The model has no trainable parameters.")
+
+    return AdamW(optimizer_grouped_parameters, lr=float(learning_rate))
 
 
 class ESMEmbeddingDistanceModel(PreTrainedModel):

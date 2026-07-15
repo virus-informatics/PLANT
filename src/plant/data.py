@@ -39,8 +39,9 @@ class TextDataset(Dataset):
         filled with zeros by default so that mixed ``ConcatDataset`` objects can
         be collated safely.
     labels:
-        Antigenic distances.  Missing labels are represented by ``-10.0`` and
-        trigger semantic-only loss in ``semanticESM.forward``.
+        Antigenic distances. Missing labels are represented by ``-10.0`` and
+        exclude the row from supervised antigenic-distance loss. The sequence
+        remains part of the unified semantic/CSE/LG regularization set.
     always_include_reference:
         If ``True`` (default), ``input_ids_reference`` and
         ``attention_mask_reference`` are included even for virus-only examples.
