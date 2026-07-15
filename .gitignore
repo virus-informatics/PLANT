@@ -4,3 +4,7 @@
 adaboost/Season_based_split_performance/
 adaboost/logs/
 
+__pycache__/
+*.py[cod]
+
+

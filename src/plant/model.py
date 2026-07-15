@@ -73,6 +73,7 @@ class semanticESM(PreTrainedModel):
         REF_TRANSFORM_W: float = 0.05,
         REF_SHIFT_W: float = 0.05,
         missing_label_value: float = MISSING_LABEL_VALUE,
+        use_systematic_error: bool = True,
         freeze_esm: bool = False,
         use_lora: bool = True,
         lora_r: int = 16,
@@ -216,6 +217,10 @@ class semanticESM(PreTrainedModel):
         self.REF_SHIFT_W = REF_SHIFT_W
         self.embed_scale_factor = float(embed_scale_factor)
         self.missing_label_value = float(missing_label_value)
+        # Model-level default used by Trainer, which does not pass a constant
+        # apply_systematic_error argument with every mini-batch. The forward
+        # argument can still explicitly override this default during inference.
+        self.use_systematic_error = bool(use_systematic_error)
 
         # OneHotEncoder objects are runtime artifacts and are intentionally kept on
         # the model instance rather than in module-global state. This allows multiple
@@ -653,6 +658,7 @@ class semanticESM(PreTrainedModel):
             "REF_TRANSFORM_W": self.REF_TRANSFORM_W,
             "REF_SHIFT_W": self.REF_SHIFT_W,
             "missing_label_value": self.missing_label_value,
+            "use_systematic_error": self.use_systematic_error,
             "freeze_esm": self.freeze_esm,
             "use_lora": self.use_lora,
             "lora_r": self.lora_r,
@@ -763,10 +769,15 @@ class semanticESM(PreTrainedModel):
         virus_passage: Optional[torch.Tensor] = None,
         reference_passage: Optional[torch.Tensor] = None,
         weight: Optional[torch.Tensor] = None,
-        apply_systematic_error: bool = True,
+        apply_systematic_error: Optional[bool] = None,
         **kwargs,
     ) -> ModelOutput:
         del dates, kwargs  # currently unused, kept for API compatibility
+        if apply_systematic_error is None:
+            apply_systematic_error = self.use_systematic_error
+        else:
+            apply_systematic_error = bool(apply_systematic_error)
+
         device = self.device
         input_ids_virus = input_ids_virus.to(device)
         attention_mask_virus = attention_mask_virus.to(device)
@@ -913,6 +924,9 @@ class semanticESM(PreTrainedModel):
                     systematic_error2 = self.systematic_error_effects(combined_encoding)
                     systematic_error = systematic_error + systematic_error2
 
+            # Ablation mode is intentionally minimal: when systematic error is
+            # disabled, the correction terms are not evaluated and remain zero, so
+            # observed_distance is exactly the cartographic distance.
             observed_distance = distance + systematic_error
             logits_labeled = torch.cat((observed_distance, distance), dim=1)
 

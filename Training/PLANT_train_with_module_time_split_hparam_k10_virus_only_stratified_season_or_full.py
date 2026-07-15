@@ -236,6 +236,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--intermediate-dim-encoder", "--intermediate_dim_encoder", dest="intermediate_dim_encoder", default=64, type=int)
     parser.add_argument("--dropout-encoder", "--dropout_encoder", dest="dropout_encoder", default=0.1, type=float)
     parser.add_argument("--lg-w", "--lg_w", dest="lg_w", default=0.0, type=float)
+
+    systematic_error_group = parser.add_mutually_exclusive_group()
+    systematic_error_group.add_argument(
+        "--use-systematic-error",
+        "--use_systematic_error",
+        dest="use_systematic_error",
+        action="store_true",
+        help=(
+            "Include learned virus/reference/passage systematic-error corrections "
+            "in observed-distance prediction (default)."
+        ),
+    )
+    systematic_error_group.add_argument(
+        "--no-use-systematic-error",
+        "--no_use_systematic_error",
+        "--no-systematic-error",
+        "--no_systematic_error",
+        dest="use_systematic_error",
+        action="store_false",
+        help=(
+            "Ablation mode: exclude systematic-error corrections so that "
+            "observed_distance equals the cartographic distance."
+        ),
+    )
+    parser.set_defaults(use_systematic_error=True)
+
     parser.add_argument(
         "--reference-transform-mode",
         "--reference_transform_mode",
@@ -1989,6 +2015,7 @@ def main() -> None:
         reference_transform_mode=args.reference_transform_mode,
         REF_TRANSFORM_W=args.ref_transform_w,
         REF_SHIFT_W=args.ref_shift_w,
+        use_systematic_error=args.use_systematic_error,
         freeze_esm=args.freeze_esm,
         use_lora=args.use_lora,
         lora_r=args.lora_r,
@@ -1998,6 +2025,10 @@ def main() -> None:
         lora_bias=args.lora_bias,
     )
     model.set_encoders(ohe_virus, ohe_ref, ohe_vp, ohe_rp)
+    print(
+        "Systematic-error correction: "
+        + ("enabled" if args.use_systematic_error else "disabled (ablation)")
+    )
 
     optimizer = build_plant_optimizer(
         model,
