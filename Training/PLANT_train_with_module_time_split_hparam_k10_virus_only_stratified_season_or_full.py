@@ -2183,6 +2183,7 @@ def main() -> None:
             "fp16": fp16,
             "token_max_length": token_max_length,
             "embed_scale_factor": embed_scale_factor,
+            "resolved_split_seed": split_seed,
             "resolved_learning_rates": {
                 "encoder": resolved_encoder_lr,
                 "regressor": resolved_regressor_lr,
