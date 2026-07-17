@@ -126,6 +126,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-steps", "--num_steps", dest="num_steps", default=20000, type=int)
     parser.add_argument("--random-seed", "--random_seed", dest="random_seed", default=42, type=int)
     parser.add_argument(
+        "--split-seed",
+        "--split_seed",
+        dest="split_seed",
+        default=None,
+        type=int,
+        help=(
+            "Seed for the train/validation/test split and the virus-only pool "
+            "subsampling. Defaults to --random-seed. Fix this while varying "
+            "--random-seed to measure training-only run-to-run variance on an "
+            "identical data split."
+        ),
+    )
+    parser.add_argument(
         "--learning-rate",
         "--learning_rate",
         dest="learning_rate",
@@ -1751,6 +1764,11 @@ def main() -> None:
     args = parse_args()
     set_seed(args.random_seed)
 
+    # The data split and the virus-only subsample are held fixed by split_seed so
+    # that run-to-run variance can be attributed to training stochasticity alone.
+    split_seed = args.random_seed if args.split_seed is None else args.split_seed
+    print(f"Seeds: random_seed={args.random_seed}, split_seed={split_seed}")
+
     deprecated_regularization_args = {
         "--CSE-w-virus-only": args.CSE_w_virus_only,
         "--semantic-w-virus-only": args.semantic_w_virus_only,
@@ -1840,7 +1858,7 @@ def main() -> None:
         raise ValueError(f"Unknown split_mode: {args.split_mode!r}")
 
     selected_df_train_val, selected_df_test = split_dataframe_with_stratified_group_kfold(
-        selected_df_past, train_ratio=0.9, seed=args.random_seed
+        selected_df_past, train_ratio=0.9, seed=split_seed
     )
     selected_df_test = selected_df_test.copy()
     selected_df_test["weight"] = 1.0
@@ -1850,7 +1868,7 @@ def main() -> None:
 
     selected_df_train_val = add_density_weights(selected_df_train_val)
     selected_df_train, selected_df_val = split_dataframe_with_stratified_group_kfold(
-        selected_df_train_val, train_ratio=8 / 9, seed=args.random_seed
+        selected_df_train_val, train_ratio=8 / 9, seed=split_seed
     )
 
     # Save only categories observed in the training split. Validation/test/future-only
@@ -1920,7 +1938,7 @@ def main() -> None:
         sequence_pool_df,
         train_size=len(selected_df_train),
         k=args.virus_only_ratio_k,
-        seed=args.random_seed,
+        seed=split_seed,
     )
     print(f"Virus-only sequence pool size after sampling: {len(sequence_pool_df)}")
     sequence_pool_df.to_csv(outputs_path / "virus_only_sequence_pool_sampled.csv", index=False)
@@ -2121,6 +2139,37 @@ def main() -> None:
     else:
         trainer.train()
     print("Training completed.")
+
+    # Dump the complete evaluation history straight from the in-memory trainer state.
+    #
+    # Do not rely on results/checkpoint-*/trainer_state.json for this. With
+    # save_total_limit=1 and load_best_model_at_end=True the surviving checkpoint can
+    # be the BEST one, whose log_history stops at the step it was written -- which is
+    # by construction the best-so-far step. Reading it back yields a curve that always
+    # ends on its own maximum, which silently breaks any early-stopping replay or
+    # peak-step analysis. trainer.state.log_history holds every evaluation regardless
+    # of checkpoint rotation.
+    log_history_path = outputs_path / "log_history.json"
+    eval_curve = [
+        {"step": int(entry["step"]), "value": float(entry["eval_selection_score_censor_cap"])}
+        for entry in trainer.state.log_history
+        if "eval_selection_score_censor_cap" in entry and "step" in entry
+    ]
+    log_history_path.write_text(
+        json.dumps(
+            {
+                "metric": "eval_selection_score_censor_cap",
+                "best_metric": trainer.state.best_metric,
+                "best_model_checkpoint": trainer.state.best_model_checkpoint,
+                "global_step": trainer.state.global_step,
+                "eval_curve": eval_curve,
+                "log_history": trainer.state.log_history,
+            },
+            indent=2,
+            default=str,
+        )
+    )
+    print(f"Saved {len(eval_curve)} evaluations to {log_history_path}")
 
     print("Saving final model and tokenizer...")
     final_model_dir = outputs_path / "model"
