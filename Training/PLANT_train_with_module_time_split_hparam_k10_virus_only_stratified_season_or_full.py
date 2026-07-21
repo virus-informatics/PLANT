@@ -184,6 +184,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", "--weight_decay", dest="weight_decay", default=0.01, type=float)
     parser.add_argument("--reg-weight-decay", "--reg_weight_decay", dest="reg_weight_decay", default=0.01, type=float)
     parser.add_argument("--max-saves", "--max_saves", dest="max_saves", default=1, type=int)
+    parser.add_argument(
+        "--save-only-model",
+        "--save_only_model",
+        dest="save_only_model",
+        action="store_true",
+        default=True,
+        help=(
+            "Save only model weights in checkpoints, not optimizer/scheduler/RNG "
+            "state. Roughly halves per-checkpoint disk use. Default True: resuming "
+            "is not needed for these fixed-length runs. Pass --allow-resume to keep "
+            "the full state."
+        ),
+    )
+    parser.add_argument(
+        "--allow-resume",
+        "--allow_resume",
+        dest="save_only_model",
+        action="store_false",
+        help="Keep optimizer/scheduler/RNG state in checkpoints so training can resume.",
+    )
     parser.add_argument("--save-steps", "--save_steps", dest="save_steps", default=1000, type=int)
     parser.add_argument("--eval-steps", "--eval_steps", dest="eval_steps", default=1000, type=int)
     parser.add_argument(
@@ -1326,15 +1346,31 @@ def make_virus_only_dataset(df: pd.DataFrame, tokenizer, max_length: int) -> Tex
 
 
 def make_training_args(**kwargs) -> TrainingArguments:
-    """Handle the evaluation_strategy -> eval_strategy rename across transformers versions."""
-    try:
-        return TrainingArguments(**kwargs)
-    except TypeError as exc:
-        if "eval_strategy" not in str(exc):
+    """Construct TrainingArguments, tolerating transformers version differences.
+
+    Handles the evaluation_strategy -> eval_strategy rename, and drops
+    save_only_model on versions that predate it (the checkpoints are simply
+    larger there; nothing breaks).
+    """
+    for _ in range(4):
+        try:
+            return TrainingArguments(**kwargs)
+        except TypeError as exc:
+            message = str(exc)
+            if "eval_strategy" in message and "eval_strategy" in kwargs:
+                kwargs = dict(kwargs)
+                kwargs["evaluation_strategy"] = kwargs.pop("eval_strategy")
+                continue
+            if "save_only_model" in message and "save_only_model" in kwargs:
+                kwargs = dict(kwargs)
+                kwargs.pop("save_only_model")
+                print(
+                    "WARNING: this transformers version has no save_only_model; "
+                    "checkpoints will also contain optimizer state (~2x larger)."
+                )
+                continue
             raise
-        kwargs = dict(kwargs)
-        kwargs["evaluation_strategy"] = kwargs.pop("eval_strategy")
-        return TrainingArguments(**kwargs)
+    return TrainingArguments(**kwargs)
 
 
 def apply_censor_cap(df: pd.DataFrame, censor_col: str, predicted_col: str, score_col: str, output_col: str) -> None:
@@ -2092,6 +2128,7 @@ def main() -> None:
         eval_strategy="steps",
         eval_steps=args.eval_steps,
         save_total_limit=args.max_saves,
+        save_only_model=args.save_only_model,
         warmup_ratio=args.warmup_ratio,
         logging_dir=str(outputs_path / "logs"),
         remove_unused_columns=False,
